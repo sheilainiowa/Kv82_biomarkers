@@ -1,0 +1,1732 @@
+---
+title: "Mouse retinas: KCNV2-KO vs WT RNA-seq Analysis"
+subtitle: "Revision 9 — KO2 excluded on knockout validation, SVA-adjusted"
+author: "Miles Pufall"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+## Revision history
+
+| File | Change |
+|---|---|
+| `sheila_rnaseq_KOvWT_3.qmd` | Original. KO2 and KO3 dropped on QC grounds (leaving 3 WT vs 3 KO of an original 3 vs 5); unshrunken log2FC; volcano at padj < 0.05 with a 20% FC cutoff. |
+| `sheila_rnaseq_KOvWT_4.qmd` | All eight samples retained. Every analysis run twice, ± SVA, to test whether the adjustment was absorbing genotype signal. |
+| `sheila_rnaseq_KOvWT_5.qmd` | Streamlined to the SVA-adjusted model throughout. Added the two-tier Müller glia gliosis panel and an over-representation suite (GO, KEGG, Reactome, WikiPathways) alongside GSEA; ± SVA comparison condensed to an appendix. |
+| `sheila_rnaseq_KOvWT_6.qmd` | Gene-panel bar charts at padj < 0.05; osmosensitive panel restored; shrunken estimates reported plainly as `log2FC`. |
+| `sheila_rnaseq_KOvWT_8.qmd` | *Kcnv2* knockout validation added as an explicit pre-modelling QC step; **KO2 excluded** because it shows no knockdown. KO3 retained. Dataset rebuilt, renormalised and SVA re-estimated on the 7 retained samples. Axis clipping to ±5 applies to the volcano panels only. |
+
+| `sheila_rnaseq_KOvWT_9.qmd` | **This file.** Input paths validated up front via a `project_dir` setting, so a missing `quants/` fails immediately with a readable message instead of silently producing an empty sample table. |
+
+## Design and rationale
+
+Eight libraries were sequenced: **WT1–3 vs KO2–6** (3 WT, 5 KO). Revision 3
+dropped KO2 and KO3 because they separated in the PCA; that decision is not
+carried forward, since removing samples on the basis of a PCA computed from the
+same expression data is circular.
+
+**KO2 is excluded here on a different and non-circular basis:** it shows no
+reduction in *Kcnv2* itself, so there is no evidence the knockout is present in
+that animal. The analysis therefore runs on **3 WT vs 4 KO**. KO3 is retained —
+it separated in the original PCA but its *Kcnv2* level sits with the true
+knockouts.
+
+The structure those two samples create is instead **modeled**: surrogate
+variable analysis estimates it and it enters the design as a covariate. The
+appendix documents why this is defensible here — SV1 carries only R² ≈ 0.12
+with genotype, and the fold changes of the strongly-called genes are
+essentially unchanged with or without the adjustment, so the SV is absorbing
+technical structure rather than competing with the contrast.
+
+Conventions used throughout:
+
+- **Design:** `~ SV1 (+ SV2) + background`, contrast KO vs WT.
+- **Effect sizes:** all reported `log2FC` values are apeglm-shrunken, which
+  is simply the fold change this design supports; the unshrunken maximum-
+  likelihood values are kept as `log2FC_MLE` for reference.
+- **Significance:** `padj < 0.01`, no fold-change cutoff.
+- **Volcano:** red up in KO, blue down, x-axis clipped to ±5 with off-scale
+  genes counted in the subtitle rather than dropped. This clip applies to the
+  volcano panels alone — every other figure is scaled to its own data.
+- **Figure export:** every panel is written to `figures_pub/` as a 4 × 4 cm
+  PDF, drawn at that size rather than scaled down. Legible versions appear
+  inline.
+
+## Trimming and Mapping
+
+### Adapter trimming with TrimGalore! (v0.6+)
+
+```
+for i in *_R1_001.fastq.gz;
+do
+  SAMPLE=$(echo ${i} | sed "s/_R1_001\.fastq.gz//")
+  trim_galore --paired -j 4 ${SAMPLE}_R1_001.fastq.gz ${SAMPLE}_R2_001.fastq.gz
+done
+```
+
+### Alignment and quantification with Salmon (v1.10.2)
+
+```
+for i in *_R1_val_1.fq.gz;
+do
+  SAMPLE=$(echo ${i} | sed "s/_R1_val_1\.fq.gz//")
+  salmon quant -i /Shared/pufall/mpufall/RNAseq/DataSets2015/3722_Dex_v_Pred/Trimmed/gen_v45_tx_index/ \
+    -p 24 -l A -1 ${SAMPLE}_R1_val_1.fq.gz -2 ${SAMPLE}_R2_val_2.fq.gz \
+    --validateMappings --seqBias --gcBias --posBias --numBootstraps 50 \
+    -o quants/${SAMPLE}
+done
+```
+
+## Setup
+
+```{r setup, include=TRUE, message=FALSE}
+bioc_pkgs <- c(
+  "tximport", "DESeq2", "apeglm", "sva", "limma",
+  "GenomicFeatures", "txdbmaker", "AnnotationDbi", "org.Mm.eg.db", "biomaRt",
+  "clusterProfiler", "enrichplot", "DOSE", "ReactomePA", "fgsea",
+  "vsn", "genefilter"
+)
+
+cran_pkgs <- c(
+  "pheatmap", "RColorBrewer", "viridis", "ggrepel", "cowplot", "ggpubr",
+  "patchwork", "msigdbr", "openxlsx", "scales", "rjson", "matrixStats",
+  "tidyverse"
+)
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", repos = "https://cloud.r-project.org")
+}
+
+missing_cran <- setdiff(cran_pkgs, rownames(installed.packages()))
+if (length(missing_cran) > 0) {
+  message("Installing missing CRAN packages: ", paste(missing_cran, collapse = ", "))
+  install.packages(missing_cran, repos = "https://cloud.r-project.org")
+}
+
+missing_bioc <- setdiff(bioc_pkgs, rownames(installed.packages()))
+if (length(missing_bioc) > 0) {
+  message("Installing missing Bioconductor packages: ", paste(missing_bioc, collapse = ", "))
+  BiocManager::install(missing_bioc, update = FALSE, ask = FALSE)
+}
+
+invisible(lapply(c(bioc_pkgs, cran_pkgs), library, character.only = TRUE))
+
+set.seed(1234)
+```
+
+### Constants and the publication figure system
+
+```{r constants}
+padj_cut  <- 0.01          # significance threshold for DE calls
+panel_padj_cut <- 0.05     # threshold used to colour the gene-panel bar charts
+vol_xlim  <- c(-5, 5)      # volcano x-axis clip -- volcanoes ONLY;
+                           # every other panel is scaled to its own data
+max_sv    <- 2             # cap on surrogate variables
+
+col_up   <- "#D62728"      # red   = up in KO
+col_down <- "#1F6FB4"      # blue  = down in KO
+col_ns   <- "grey75"
+sig_cols <- c(Up = col_up, Down = col_down, NS = col_ns)
+geno_cols <- c(WT = "grey35", KO = col_up)
+
+PUB_CM  <- 4
+FIG_DIR <- "figures_pub"
+dir.create(FIG_DIR, showWarnings = FALSE)
+
+pdf_device <- if (isTRUE(capabilities("cairo"))) grDevices::cairo_pdf else grDevices::pdf
+
+# Plot functions take pub = TRUE/FALSE. A figure drawn for a 15 cm screen and
+# then scaled to 4 cm has hairline strokes and unreadable type, so the same
+# plot is drawn twice at its intended size instead.
+pub_style <- function(pub) {
+  if (pub) {
+    list(base = 5, pt = 0.30, stroke = 0.20, lab = 1.35,
+         alpha = 0.55, bar_w = 0.65, err_w = 0.15)
+  } else {
+    list(base = 12, pt = 1.20, stroke = 0.45, lab = 2.90,
+         alpha = 0.70, bar_w = 0.70, err_w = 0.25)
+  }
+}
+
+theme_pub <- function(pub) {
+  s <- pub_style(pub)
+  theme_bw(base_size = s$base) +
+    theme(
+      panel.border      = element_rect(linewidth = s$stroke, color = "grey20"),
+      panel.grid.minor  = element_blank(),
+      panel.grid.major  = element_line(linewidth = s$stroke * 0.6),
+      axis.ticks        = element_line(linewidth = s$stroke),
+      axis.ticks.length = unit(if (pub) 1 else 2.5, "pt"),
+      plot.title        = element_text(face = "bold",
+                                       size = rel(if (pub) 1.0 else 1.05)),
+      plot.subtitle     = element_text(size = rel(0.85), color = "grey30"),
+      plot.margin       = margin(if (pub) 1 else 5, if (pub) 2 else 5,
+                                 if (pub) 1 else 5, if (pub) 1 else 5),
+      legend.key.size   = unit(if (pub) 4 else 12, "pt"),
+      legend.margin     = margin(0, 0, 0, 0),
+      legend.box.spacing = unit(if (pub) 1 else 5, "pt"),
+      legend.text       = element_text(size = rel(0.8)),
+      legend.title      = element_text(size = rel(0.85), face = "bold"),
+      strip.text        = element_text(size = rel(0.85), face = "bold")
+    )
+}
+
+save_pub <- function(plot, filename, cm = PUB_CM, cm_h = NULL) {
+  ggsave(file.path(FIG_DIR, filename), plot,
+         width = cm, height = if (is.null(cm_h)) cm else cm_h,
+         units = "cm", device = pdf_device)
+  invisible(file.path(FIG_DIR, filename))
+}
+
+# Draw legibly for the HTML and write the 4 cm version from the same function,
+# so the two can never drift apart.
+show_both <- function(fun, filename, ..., cm_h = NULL) {
+  save_pub(fun(pub = TRUE, ...), filename, cm_h = cm_h)
+  fun(pub = FALSE, ...)
+}
+```
+
+## Mapping statistics
+
+```{r sample-table}
+# Point this at the folder holding quants/ and the annotation GTF. "." is the
+# folder containing this .qmd, which is what Quarto uses as the working
+# directory during a render -- so the default is correct as long as the .qmd
+# sits beside the data.
+project_dir <- "."
+
+dir      <- file.path(project_dir, "quants")
+gtf_file <- file.path(project_dir, "gencode.vM38.annotation.gtf.gz")
+
+# ---------------------------------------------------------------------------
+# Input validation.
+#
+# list.files() on a path that does not exist returns character(0) -- silently,
+# with no error and no warning. An empty sample table then propagates: kable()
+# prints an empty table without complaint, and the render dies several chunks
+# later inside whichever function first cannot cope with zero rows. Every such
+# failure looks like a parsing bug rather than a missing directory. Check here
+# instead, and fail with something that names the actual problem.
+# ---------------------------------------------------------------------------
+if (!dir.exists(dir)) {
+  stop("Cannot find the quants/ directory.\n",
+       "  Looked for  : ", normalizePath(dir, mustWork = FALSE), "\n",
+       "  Working dir : ", getwd(), "\n",
+       "  That folder contains: ",
+       paste(head(list.files(project_dir), 30), collapse = ", "), "\n",
+       "Quarto renders with the .qmd's own folder as the working directory. ",
+       "Either move this file next to quants/, or set `project_dir` above to ",
+       "the folder that holds it.")
+}
+
+sample_dirs <- list.files(dir)
+
+if (length(sample_dirs) == 0) {
+  stop("quants/ exists at ", normalizePath(dir), " but contains no samples.")
+}
+
+sample_table <- sample_dirs %>%
+  as_tibble_col(column_name = "names") %>%
+  mutate(
+    background = ifelse(substr(names, 1, 1) == "W", "WT", "KO"),
+    rep        = as.integer(str_sub(names, -1)),
+    background = factor(background, levels = c("WT", "KO"))
+  ) %>%
+  arrange(background, rep)
+
+sample_table$files <- file.path(dir, sample_table$names, "quant.sf")
+sample_table$meta  <- file.path(dir, sample_table$names, "aux_info", "meta_info.json")
+
+# Both files must exist for every sample before anything else runs.
+for (col in c("files", "meta")) {
+  absent <- sample_table$names[!file.exists(sample_table[[col]])]
+  if (length(absent) > 0) {
+    stop("Missing ", col, " for: ", paste(absent, collapse = ", "),
+         "\n  Expected e.g. ", sample_table[[col]][1])
+  }
+}
+
+if (!file.exists(gtf_file)) {
+  stop("Cannot find the annotation GTF.\n  Looked for : ",
+       normalizePath(gtf_file, mustWork = FALSE),
+       "\n  Working dir: ", getwd())
+}
+
+cat("Found ", nrow(sample_table), " samples in ", normalizePath(dir), "\n", sep = "")
+
+knitr::kable(dplyr::select(sample_table, names, background, rep),
+             caption = "Samples included in this analysis")
+```
+
+```{r mapping-stats}
+# One row per sample, built explicitly.
+#
+# The sapply(...) + t() idiom is fragile: sapply only simplifies to a matrix
+# when every meta_info.json returns a list of identical length. Salmon omits or
+# adds fields depending on flags and version, so one sample with an extra field
+# makes sapply return a plain list, t() yields a 1 x n matrix, and everything
+# downstream silently collapses to a single row.
+
+drop_fields <- c("quant_errors", "eq_class_properties", "length_classes")
+
+read_meta <- function(x) {
+  mi <- rjson::fromJSON(file = sample_table$meta[match(x, sample_table$names)])
+  mi <- mi[setdiff(names(mi), drop_fields)]
+
+  # Keep atomic scalars only. as_tibble() on the filtered list is not safe: if
+  # the filter leaves nothing, it returns a 0 x 0 tibble, mutate() then adds a
+  # column to zero rows, and map_dfr binds a frame with no `sample` column at
+  # all -- at which point `sample` in the next mutate() resolves to base::sample
+  # and R reports the baffling "cannot coerce type 'closure'". Building the row
+  # from a guaranteed one-row tibble removes that whole failure path.
+  is_scalar <- vapply(mi, function(v) is.atomic(v) && length(v) == 1, logical(1))
+  mi <- mi[is_scalar]
+
+  out <- tibble::tibble(sample = x)
+  for (nm in names(mi)) out[[nm]] <- mi[[nm]]
+  out
+}
+
+rs_tidy_tbl <- map_dfr(sample_table$names, read_meta)
+
+if (!"sample" %in% names(rs_tidy_tbl)) {
+  stop("No `sample` column after parsing meta_info.json. Columns found: ",
+       paste(names(rs_tidy_tbl), collapse = ", "))
+}
+
+cat("Parsed fields:", paste(setdiff(names(rs_tidy_tbl), "sample"), collapse = ", "), "\n")
+
+rs_tidy_tbl <- rs_tidy_tbl %>%
+  mutate(sample = factor(sample, levels = sample_table$names))
+
+needed <- c("num_processed", "num_mapped", "percent_mapped")
+missing_fields <- setdiff(needed, names(rs_tidy_tbl))
+
+if ("percent_mapped" %in% missing_fields &&
+    all(c("num_processed", "num_mapped") %in% names(rs_tidy_tbl))) {
+  rs_tidy_tbl <- rs_tidy_tbl %>%
+    mutate(percent_mapped = 100 * as.numeric(num_mapped) / as.numeric(num_processed))
+  missing_fields <- setdiff(missing_fields, "percent_mapped")
+}
+
+if (length(missing_fields) > 0) {
+  stop("meta_info.json is missing required field(s): ",
+       paste(missing_fields, collapse = ", "),
+       "\nFields found: ", paste(names(rs_tidy_tbl), collapse = ", "))
+}
+
+rs_tidy_tbl <- rs_tidy_tbl %>%
+  mutate(across(all_of(needed), as.numeric),
+         mapped_M = num_mapped / 1e6)
+
+if (nrow(rs_tidy_tbl) != nrow(sample_table)) {
+  stop("Parsed ", nrow(rs_tidy_tbl), " mapping-stat rows for ",
+       nrow(sample_table), " samples.")
+}
+
+ave_reads  <- round(mean(rs_tidy_tbl$num_processed), 0)
+ave_mapped <- round(mean(rs_tidy_tbl$percent_mapped), 0)
+```
+
+Mean depth `r format(ave_reads, big.mark = ",")` read pairs; mean mapping rate
+`r ave_mapped`%.
+
+```{r plot-mapping, fig.width=10, fig.height=4}
+p_mapping <- function(pub, yvar, ylab, title) {
+  s <- pub_style(pub)
+  ggplot(rs_tidy_tbl, aes(sample, .data[[yvar]], fill = .data[[yvar]])) +
+    geom_col(color = "white", width = s$bar_w, linewidth = s$stroke) +
+    scale_fill_viridis_c(option = "mako", begin = 0.3, end = 0.85, guide = "none") +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    labs(title = title, x = NULL, y = ylab) +
+    theme_pub(pub) +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+          panel.grid.major.x = element_blank())
+}
+
+p_reads <- show_both(p_mapping, "qc_mapped_reads.pdf",
+                     yvar = "mapped_M", ylab = "Mapped reads (M)",
+                     title = "Mapped reads")
+p_rate  <- show_both(p_mapping, "qc_mapping_rate.pdf",
+                     yvar = "percent_mapped", ylab = "Percent mapped (%)",
+                     title = "Mapping rate")
+
+p_reads | p_rate
+```
+
+## Import into DESeq2
+
+```{r import-txi, message=TRUE}
+# Paths and existence were validated in the sample-table chunk.
+make_txdb_from_gff <- if (requireNamespace("txdbmaker", quietly = TRUE)) {
+  txdbmaker::makeTxDbFromGFF
+} else {
+  GenomicFeatures::makeTxDbFromGFF
+}
+
+txdb    <- make_txdb_from_gff(gtf_file)
+k       <- keys(txdb, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(txdb, k, "GENEID", "TXNAME")
+
+tx2gene$TXNAME <- sub("\\.\\d+$", "", tx2gene$TXNAME)
+tx2gene$GENEID <- sub("\\.\\d+$", "", tx2gene$GENEID)
+
+txi <- tximport(sample_table$files, type = "salmon",
+                tx2gene = tx2gene, ignoreTxVersion = TRUE)
+colnames(txi$counts) <- sample_table$names
+```
+
+```{r build-dds-all}
+dds_all <- DESeqDataSetFromTximport(txi,
+                                    colData = as.data.frame(sample_table),
+                                    design  = ~ background)
+colnames(dds_all) <- sample_table$names
+
+# Pre-filter: at least 10 counts in at least 3 samples (the smaller group size).
+keep    <- rowSums(counts(dds_all) >= 10) >= 3
+dds_all <- dds_all[keep, ]
+dds_all <- estimateSizeFactors(dds_all)
+
+cat("Genes retained after filtering:", nrow(dds_all), "\n")
+cat("Samples:", ncol(dds_all), "\n")
+```
+
+## Sample QC
+
+```{r qc-pca, fig.width=6, fig.height=5}
+vsd_all <- vst(dds_all, blind = TRUE)
+
+pca_plot <- function(pub, mat, coldata, title, ntop = 5000, label = TRUE) {
+  s   <- pub_style(pub)
+  rv  <- matrixStats::rowVars(mat)
+  sel <- order(rv, decreasing = TRUE)[seq_len(min(ntop, length(rv)))]
+  pca <- prcomp(t(mat[sel, ]))
+  pv  <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+  df  <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2],
+                    name = colnames(mat), background = coldata$background)
+
+  p <- ggplot(df, aes(PC1, PC2, color = background)) +
+    geom_point(size = s$pt * 2.5) +
+    scale_color_manual(values = geno_cols, name = NULL) +
+    labs(title = title,
+         x = paste0("PC1 (", pv[1], "%)"),
+         y = paste0("PC2 (", pv[2], "%)")) +
+    theme_pub(pub)
+
+  if (label) {
+    p <- p + ggrepel::geom_text_repel(aes(label = name), size = s$lab,
+                                      box.padding = 0.3, segment.linewidth = s$stroke,
+                                      segment.color = "grey60", max.overlaps = 15,
+                                      show.legend = FALSE)
+  }
+  p
+}
+
+pca_all <- show_both(pca_plot, "qc_pca_uncorrected.pdf",
+                     mat = assay(vsd_all), coldata = colData(dds_all),
+                     title = "PCA: uncorrected")
+pca_all
+```
+
+```{r qc-distances, fig.width=6, fig.height=5}
+sampleDists      <- dist(t(assay(vsd_all)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- colnames(vsd_all)
+colnames(sampleDistMatrix) <- NULL
+
+dist_args <- function(fontsize, main) {
+  list(mat = sampleDistMatrix,
+       clustering_distance_rows = sampleDists,
+       clustering_distance_cols = sampleDists,
+       col = colorRampPalette(rev(brewer.pal(9, "Blues")))(255),
+       main = main, fontsize = fontsize, border_color = NA)
+}
+
+pdf_device(file.path(FIG_DIR, "qc_sample_distances.pdf"),
+           width = PUB_CM / 2.54, height = PUB_CM / 2.54)
+do.call(pheatmap, dist_args(3.5, "Sample distances"))
+invisible(dev.off())
+
+do.call(pheatmap, dist_args(10, "Sample-to-sample distances"))
+```
+
+```{r qc-cooks, fig.width=6, fig.height=4.5}
+# Cook's distance flags counts with outsized leverage on the fit -- a more
+# specific diagnosis than "it sits apart in the PCA".
+dds_cook <- estimateDispersions(dds_all, quiet = TRUE)
+dds_cook <- nbinomWaldTest(dds_cook)
+
+cooks_df <- as.data.frame(log10(assays(dds_cook)[["cooks"]])) %>%
+  pivot_longer(everything(), names_to = "sample", values_to = "log10_cooks") %>%
+  mutate(sample = factor(sample, levels = colnames(dds_cook)))
+
+p_cooks_fun <- function(pub) {
+  s <- pub_style(pub)
+  ggplot(cooks_df, aes(sample, log10_cooks, fill = sample)) +
+    geom_boxplot(outlier.size = s$pt * 0.5, outlier.alpha = 0.15,
+                 linewidth = s$stroke, show.legend = FALSE) +
+    scale_fill_viridis_d(option = "mako", begin = 0.3, end = 0.85) +
+    labs(title = "Cook's distance", x = NULL,
+         y = expression(log[10]~"Cook's D")) +
+    theme_pub(pub) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.major.x = element_blank())
+}
+
+show_both(p_cooks_fun, "qc_cooks_distance.pdf")
+```
+
+```{r qc-detection, fig.width=6, fig.height=4.5}
+detected <- tibble(
+  sample     = colnames(dds_all),
+  detected   = colSums(counts(dds_all) >= 10),
+  background = colData(dds_all)$background
+) %>% mutate(sample = factor(sample, levels = colnames(dds_all)))
+
+p_detected_fun <- function(pub) {
+  s <- pub_style(pub)
+  ggplot(detected, aes(sample, detected, fill = background)) +
+    geom_col(width = s$bar_w, color = "white", linewidth = s$stroke) +
+    scale_fill_manual(values = geno_cols, name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05)),
+                       labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(title = "Genes detected", x = NULL, y = "Genes (>=10 counts)") +
+    theme_pub(pub) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.major.x = element_blank())
+}
+
+show_both(p_detected_fun, "qc_genes_detected.pdf")
+```
+
+## Knockout validation and sample exclusion
+
+Before any modelling, confirm the knockout is actually present in each animal
+labelled KO. This is the one sample-level exclusion criterion in the analysis,
+and it is deliberately **external to the expression structure**: it asks whether
+the experimental manipulation worked in a given animal, not whether that animal
+resembles its group-mates transcriptome-wide. That distinction is what separates
+it from the PCA-based exclusion in revision 3, which used the data to decide
+which data to keep.
+
+```{r ko-validation, fig.width=6, fig.height=4.5}
+ko_gene <- "Kcnv2"
+
+ko_ens <- suppressMessages(
+  AnnotationDbi::mapIds(org.Mm.eg.db, keys = ko_gene, column = "ENSEMBL",
+                        keytype = "SYMBOL", multiVals = "first"))
+
+if (is.na(ko_ens) || !ko_ens %in% rownames(dds_all)) {
+  stop(ko_gene, " was not found in the filtered count matrix; knockout ",
+       "validation cannot be performed.")
+}
+
+ko_df <- tibble(
+  sample     = colnames(dds_all),
+  background = colData(dds_all)$background,
+  count      = counts(dds_all, normalized = TRUE)[ko_ens, ]
+) %>% mutate(sample = factor(sample, levels = colnames(dds_all)))
+
+# Decision rule, stated before it is applied: a KO animal whose Kcnv2 level
+# reaches the lowest WT shows no evidence of knockdown. Deriving the threshold
+# from the WT range rather than hard-coding a sample name keeps the rule
+# reproducible and makes it obvious if a future dataset flags something else.
+min_wt  <- min(ko_df$count[ko_df$background == "WT"])
+ko_flag <- ko_df %>%
+  dplyr::filter(background == "KO", count >= min_wt) %>%
+  pull(sample) %>% as.character()
+
+knitr::kable(
+  ko_df %>%
+    mutate(pct_of_WT_min = round(100 * count / min_wt, 1),
+           knockdown = case_when(background == "WT" ~ "-",
+                                 count < min_wt ~ "yes",
+                                 TRUE ~ "NO")) %>%
+    dplyr::select(sample, background, count, pct_of_WT_min, knockdown),
+  digits = 0, caption = paste0(ko_gene, " normalized counts, all samples"))
+
+p_ko_fun <- function(pub) {
+  s <- pub_style(pub)
+  ggplot(ko_df, aes(background, count, color = background)) +
+    geom_hline(yintercept = min_wt, linetype = "dashed",
+               color = "grey40", linewidth = s$stroke) +
+    geom_point(position = position_jitter(width = 0.12, seed = 1),
+               size = s$pt * 2.5, alpha = 0.9) +
+    ggrepel::geom_text_repel(aes(label = sample), size = s$lab,
+                             position = position_jitter(width = 0.12, seed = 1),
+                             segment.color = "grey60", show.legend = FALSE) +
+    scale_color_manual(values = geno_cols, guide = "none") +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(title = ko_gene, subtitle = "dashed line = lowest WT",
+         x = NULL, y = "Normalized count") +
+    theme_pub(pub)
+}
+
+show_both(p_ko_fun, "ko_validation_kcnv2.pdf")
+
+if (length(ko_flag) > 0) {
+  cat("\nKO samples with NO evidence of Kcnv2 knockdown: ",
+      paste(ko_flag, collapse = ", "), "\n", sep = "")
+} else {
+  cat("\nAll KO samples show reduced Kcnv2.\n")
+}
+```
+
+```{r exclusion-statement}
+excluded_samples <- ko_flag
+
+if (length(excluded_samples) > 0) {
+  cat("EXCLUDED FROM ALL DOWNSTREAM ANALYSIS: ",
+      paste(excluded_samples, collapse = ", "),
+      "\nReason: no reduction in ", ko_gene,
+      " relative to the WT range, i.e. the knockout is not detectable in ",
+      "this animal.\n", sep = "")
+}
+
+sample_table_keep <- sample_table %>%
+  dplyr::filter(!names %in% excluded_samples)
+
+cat("\nRetained: ", nrow(sample_table_keep), " samples (",
+    sum(sample_table_keep$background == "WT"), " WT, ",
+    sum(sample_table_keep$background == "KO"), " KO)\n", sep = "")
+```
+
+::: {.callout-important}
+## Sample exclusion
+
+**KO2 is excluded from all downstream analysis.** Its *Kcnv2* level is not
+merely within the WT range but above every WT sample, which is not what an
+animal carrying the knockout allele should look like. The most likely
+explanations are a mis-genotyped animal or a sample swap at collection or
+library preparation.
+
+The exclusion is applied **before** normalisation, filtering, dispersion
+estimation and surrogate variable analysis, because all four use every sample
+in the object. Dropping KO2 only at the results stage would leave its influence
+baked into the size factors and the surrogate variables.
+
+KO3 is **retained**. It separated alongside KO2 in the original PCA, but its
+*Kcnv2* level sits with the other true knockouts, so the knockout-verification
+criterion keeps it. Excluding it would require falling back on the PCA argument
+this re-analysis rejects.
+
+Worth confirming independently by genotyping PCR if DNA remains — a
+transcript-level result is suggestive of a swap, not proof of one.
+:::
+
+### Rebuilding the dataset on the retained samples
+
+```{r build-dds}
+# Rebuilt from the Salmon output rather than subset from dds_all, so that size
+# factors, the low-count filter and every subsequent estimate are computed on
+# the retained samples alone.
+txi_keep <- tximport(sample_table_keep$files, type = "salmon",
+                     tx2gene = tx2gene, ignoreTxVersion = TRUE)
+colnames(txi_keep$counts) <- sample_table_keep$names
+
+dds_pre <- DESeqDataSetFromTximport(txi_keep,
+                                    colData = as.data.frame(sample_table_keep),
+                                    design  = ~ background)
+colnames(dds_pre) <- sample_table_keep$names
+
+# Same rule as before: at least 10 counts in at least 3 samples (smaller group).
+keep    <- rowSums(counts(dds_pre) >= 10) >= 3
+dds_pre <- dds_pre[keep, ]
+dds_pre <- estimateSizeFactors(dds_pre)
+
+cat("Genes retained after filtering:", nrow(dds_pre), "\n")
+cat("Samples in the model:", ncol(dds_pre), "\n")
+```
+
+## Surrogate variables
+
+```{r sva}
+dat <- counts(dds_pre, normalized = TRUE)
+dat <- dat[rowMeans(dat) > 1, ]
+
+mod  <- model.matrix(~ background, data = as.data.frame(colData(dds_pre)))
+mod0 <- model.matrix(~ 1,          data = as.data.frame(colData(dds_pre)))
+
+n_sv_est <- sva::num.sv(dat, mod, method = "be")
+n_sv     <- min(n_sv_est, max_sv)
+
+cat("SVs suggested by num.sv (be):", n_sv_est, "\n")
+cat("SVs used:", n_sv, "\n")
+
+if (n_sv > 0) {
+  svseq  <- sva::svaseq(dat, mod, mod0, n.sv = n_sv)
+  sv_mat <- svseq$sv
+  colnames(sv_mat) <- paste0("SV", seq_len(n_sv))
+  rownames(sv_mat) <- colnames(dds_pre)
+} else {
+  sv_mat <- NULL
+  message("No surrogate variables detected; the model reduces to ~ background.")
+}
+```
+
+An SV orthogonal to genotype can only remove noise; the more of the genotype
+contrast it contains, the more real effect it removes alongside. `R²` is from
+regressing each SV on genotype — near 0 is safe.
+
+```{r sv-genotype-overlap}
+if (!is.null(sv_mat)) {
+  sv_geno <- map_dfr(seq_len(ncol(sv_mat)), function(i) {
+    fit <- lm(sv_mat[, i] ~ colData(dds_pre)$background)
+    tibble(SV       = colnames(sv_mat)[i],
+           R2       = summary(fit)$r.squared,
+           p_value  = anova(fit)$`Pr(>F)`[1],
+           cor_geno = cor(sv_mat[, i], as.numeric(colData(dds_pre)$background)))
+  })
+  knitr::kable(sv_geno, digits = 3,
+               caption = "Association of each surrogate variable with genotype")
+}
+```
+
+```{r sva-loadings, fig.width=7, fig.height=4}
+p_sv_fun <- function(pub) {
+  s <- pub_style(pub)
+  sv_df <- as_tibble(sv_mat) %>%
+    mutate(sample = colnames(dds_pre),
+           background = colData(dds_pre)$background) %>%
+    pivot_longer(starts_with("SV"), names_to = "SV", values_to = "loading") %>%
+    mutate(sample = factor(sample, levels = colnames(dds_pre)))
+
+  ggplot(sv_df, aes(sample, loading, fill = background)) +
+    geom_col(width = s$bar_w, color = "white", linewidth = s$stroke) +
+    geom_hline(yintercept = 0, color = "grey30", linewidth = s$stroke) +
+    scale_fill_manual(values = geno_cols, name = NULL) +
+    facet_wrap(~ SV, ncol = 1) +
+    labs(title = "SV loadings", x = NULL, y = "Loading") +
+    theme_pub(pub) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid.major.x = element_blank())
+}
+
+if (!is.null(sv_mat)) show_both(p_sv_fun, "qc_sv_loadings.pdf")
+```
+
+```{r pca-corrected, fig.width=11, fig.height=5}
+# A fresh VST on the retained samples -- vsd_all was computed on all eight and
+# its dispersion trend still carries the excluded library.
+vsd <- vst(dds_pre, blind = FALSE)
+
+pca_keep <- show_both(pca_plot, "qc_pca_retained.pdf",
+                      mat = assay(vsd), coldata = colData(dds_pre),
+                      title = "PCA: retained samples")
+
+# Visualization only -- the model uses the covariates directly, not this matrix.
+if (!is.null(sv_mat)) {
+  mat_corr <- limma::removeBatchEffect(
+    assay(vsd), covariates = sv_mat,
+    design = model.matrix(~ background, data = as.data.frame(colData(dds_pre)))
+  )
+  pca_corr <- show_both(pca_plot, "qc_pca_sv_corrected.pdf",
+                        mat = mat_corr, coldata = colData(dds_pre),
+                        title = "PCA: SV-corrected")
+  pca_keep | pca_corr
+} else {
+  mat_corr <- assay(vsd)
+  pca_keep
+}
+```
+
+## Differential expression: KO vs WT
+
+```{r deseq}
+dds <- dds_pre
+if (!is.null(sv_mat)) {
+  for (i in seq_len(ncol(sv_mat))) {
+    colData(dds)[[colnames(sv_mat)[i]]] <- sv_mat[, i]
+  }
+  design(dds) <- as.formula(
+    paste("~", paste(c(colnames(sv_mat), "background"), collapse = " + "))
+  )
+}
+
+cat("Design:", deparse(design(dds)), "\n")
+
+dds     <- DESeq(dds)
+res_mle <- results(dds, name = "background_KO_vs_WT", alpha = padj_cut)
+summary(res_mle, alpha = padj_cut)
+
+# apeglm shrinkage. Passing res = res_mle keeps the Wald p-values and the
+# independent-filtering-adjusted padj, so only effect sizes change.
+res_ko <- lfcShrink(dds, coef = "background_KO_vs_WT",
+                    type = "apeglm", res = res_mle, quiet = TRUE)
+```
+
+### Annotation and export
+
+```{r annotation}
+# biomaRt returns "" (not NA) for genes with no symbol; an empty string is a
+# legal-but-meaningless name that breaks fgsea and creates phantom rows in
+# joins. Normalize blanks to NA at the source.
+blank_to_na <- function(x) {
+  x <- as.character(x)
+  x[!nzchar(trimws(x))] <- NA_character_
+  x
+}
+
+anno_map <- function(ids) {
+  pull_map <- function(col) {
+    suppressMessages(mapIds(org.Mm.eg.db, keys = ids, column = col,
+                            keytype = "ENSEMBL", multiVals = "first"))
+  }
+
+  symbol      <- blank_to_na(pull_map("SYMBOL"))
+  entrez      <- blank_to_na(pull_map("ENTREZID"))
+  description <- blank_to_na(pull_map("GENENAME"))
+  missing_any <- is.na(symbol) | is.na(entrez) | is.na(description)
+
+  if (any(missing_any)) {
+    ann <- tryCatch({
+      ensembl <- biomaRt::useEnsembl("genes", dataset = "mmusculus_gene_ensembl")
+      biomaRt::getBM(
+        attributes = c("ensembl_gene_id", "external_gene_name",
+                       "entrezgene_id", "description"),
+        filters = "ensembl_gene_id", values = ids[missing_any], mart = ensembl)
+    }, error = function(e) {
+      message("biomaRt unavailable (", conditionMessage(e),
+              "); keeping org.Mm.eg.db annotation only.")
+      NULL
+    })
+
+    if (!is.null(ann) && nrow(ann) > 0) {
+      idx  <- match(ids, ann$ensembl_gene_id)
+      fill <- function(x, from) ifelse(is.na(x), blank_to_na(from)[idx], x)
+      symbol      <- fill(symbol,      ann$external_gene_name)
+      entrez      <- fill(entrez,      as.character(ann$entrezgene_id))
+      description <- fill(description, ann$description)
+    }
+  }
+
+  tibble(ensemblID   = ids,
+         symbol      = blank_to_na(unname(symbol)),
+         entrez      = blank_to_na(unname(entrez)),
+         description = blank_to_na(unname(description)))
+}
+
+gene_anno <- anno_map(rownames(dds))
+
+cat("Genes with a usable symbol: ", sum(!is.na(gene_anno$symbol)),
+    " of ", nrow(gene_anno), "\n", sep = "")
+cat("Genes with a usable Entrez ID: ", sum(!is.na(gene_anno$entrez)),
+    " of ", nrow(gene_anno), "\n", sep = "")
+
+res_tbl <- as.data.frame(res_ko) %>%
+  rownames_to_column("ensemblID") %>%
+  as_tibble() %>%
+  dplyr::rename(log2FC = log2FoldChange) %>%
+  mutate(
+    log2FC_MLE = res_mle$log2FoldChange[match(ensemblID, rownames(res_mle))],
+    lfcSE_MLE  = res_mle$lfcSE[match(ensemblID, rownames(res_mle))],
+    stat_MLE   = res_mle$stat[match(ensemblID, rownames(res_mle))]
+  ) %>%
+  left_join(gene_anno, by = "ensemblID") %>%
+  relocate(symbol, description, entrez, ensemblID) %>%
+  arrange(padj)
+
+sig_tbl <- res_tbl %>% dplyr::filter(padj < padj_cut)
+
+cat("\nSignificant at padj < ", padj_cut, ": ", nrow(sig_tbl),
+    " (", sum(sig_tbl$log2FC > 0), " up, ",
+    sum(sig_tbl$log2FC < 0), " down)\n", sep = "")
+
+write_csv(res_tbl, "KOvWT_SVA_results.csv")
+openxlsx::write.xlsx(
+  list(all_genes = res_tbl,
+       sig_up    = sig_tbl %>% dplyr::filter(log2FC > 0),
+       sig_down  = sig_tbl %>% dplyr::filter(log2FC < 0)),
+  file = "KOvWT_SVA_results.xlsx", overwrite = TRUE)
+
+knitr::kable(
+  sig_tbl %>%
+    dplyr::select(symbol, log2FC, lfcSE, padj, baseMean) %>%
+    head(25),
+  digits = 3, caption = "Top 25 genes by adjusted p-value")
+```
+
+### Kcnv2 in the fitted model
+
+```{r kcnv2-result}
+kcnv2_res <- res_tbl %>% dplyr::filter(symbol == ko_gene)
+
+if (nrow(kcnv2_res) > 0) {
+  knitr::kable(kcnv2_res %>%
+                 dplyr::select(symbol, baseMean, log2FC, lfcSE, pvalue, padj),
+               digits = 4,
+               caption = paste0(ko_gene, " in the retained-sample model"))
+} else {
+  message(ko_gene, " did not survive count filtering in the retained samples.")
+}
+```
+
+## Volcano plot
+
+```{r volcano, fig.width=7, fig.height=6}
+make_volcano <- function(pub, tbl, title, label_n = 15) {
+  s  <- pub_style(pub)
+  df <- tbl %>%
+    dplyr::filter(!is.na(log2FC), !is.na(padj)) %>%
+    mutate(cat = case_when(
+      padj < padj_cut & log2FC > 0 ~ "Up",
+      padj < padj_cut & log2FC < 0 ~ "Down",
+      TRUE ~ "NS"))
+
+  n_up   <- sum(df$cat == "Up")
+  n_down <- sum(df$cat == "Down")
+  n_off  <- sum(df$log2FC < vol_xlim[1] | df$log2FC > vol_xlim[2])
+
+  sub <- paste0(n_up, " up, ", n_down, " down")
+  if (n_off > 0) sub <- paste0(sub, "; ", n_off, " outside ±5")
+
+  lab_df <- if (label_n > 0) {
+    df %>%
+      dplyr::filter(cat != "NS",
+                    dplyr::between(log2FC, vol_xlim[1], vol_xlim[2])) %>%
+      slice_min(padj, n = label_n, with_ties = FALSE)
+  } else df[0, ]
+
+  p <- ggplot(df, aes(log2FC, -log10(padj), color = cat)) +
+    geom_point(alpha = s$alpha, size = s$pt) +
+    scale_color_manual(values = sig_cols, breaks = c("Up", "NS", "Down"),
+                       labels = c("Up in KO", "n.s.", "Down in KO"),
+                       name = paste0("padj < ", padj_cut)) +
+    geom_hline(yintercept = -log10(padj_cut), linetype = "dashed",
+               color = "grey40", linewidth = s$stroke) +
+    geom_vline(xintercept = 0, linetype = "dotted",
+               color = "grey60", linewidth = s$stroke) +
+    scale_x_continuous(breaks = seq(vol_xlim[1], vol_xlim[2], by = 2.5)) +
+    coord_cartesian(xlim = vol_xlim) +
+    labs(title = title, subtitle = sub,
+         x = expression(log[2]~"(KO / WT)"), y = expression(-log[10]~padj)) +
+    theme_pub(pub) +
+    guides(color = guide_legend(override.aes = list(size = s$pt * 2.2, alpha = 1)))
+
+  if (nrow(lab_df) > 0) {
+    p <- p + ggrepel::geom_text_repel(
+      data = lab_df, aes(label = symbol), size = s$lab, fontface = "italic",
+      max.overlaps = 20, box.padding = 0.25, segment.color = "grey60",
+      segment.linewidth = s$stroke, show.legend = FALSE)
+  }
+
+  if (pub) {
+    p + theme(legend.position = "bottom", legend.direction = "horizontal")
+  } else {
+    p + theme(legend.position = "inside", legend.position.inside = c(0.15, 0.88),
+              legend.background = element_rect(fill = alpha("white", 0.7), color = NA))
+  }
+}
+
+save_pub(make_volcano(TRUE, res_tbl, "KCNV2-KO vs WT", label_n = 8), "volcano.pdf")
+save_pub(make_volcano(TRUE, res_tbl, "KCNV2-KO vs WT", label_n = 0), "volcano_nolabels.pdf")
+
+make_volcano(FALSE, res_tbl, "KCNV2-KO vs WT — SVA-adjusted")
+```
+
+## Diagnostics
+
+```{r diagnostics, fig.width=13, fig.height=5}
+p_shrink_fun <- function(pub) {
+  s  <- pub_style(pub)
+  df <- res_tbl %>% dplyr::filter(!is.na(log2FC), !is.na(log2FC_MLE))
+
+  ggplot(df, aes(log2FC_MLE, log2FC, color = log10(baseMean))) +
+    geom_point(alpha = s$alpha * 0.7, size = s$pt) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                color = "grey40", linewidth = s$stroke) +
+    scale_color_viridis_c(option = "viridis", name = expression(log[10]~baseMean)) +
+    labs(title = "Shrinkage", x = "log2FC (MLE)", y = "log2FC (apeglm)") +
+    theme_pub(pub) +
+    theme(legend.position = if (pub) "none" else "right")
+}
+
+p_hist_fun <- function(pub) {
+  s <- pub_style(pub)
+  ggplot(as.data.frame(res_mle) %>% dplyr::filter(!is.na(pvalue)), aes(pvalue)) +
+    geom_histogram(binwidth = 0.025, fill = "#3B4A6B",
+                   color = "white", linewidth = s$stroke * 0.7) +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(title = "p-value distribution", x = "p-value", y = "Genes") +
+    theme_pub(pub)
+}
+
+p_ma_fun <- function(pub) {
+  s  <- pub_style(pub)
+  df <- res_tbl %>%
+    dplyr::filter(baseMean > 0, !is.na(log2FC)) %>%
+    mutate(dir = case_when(is.na(padj) | padj >= padj_cut ~ "NS",
+                           log2FC > 0 ~ "Up", TRUE ~ "Down"))
+
+  ggplot(df, aes(baseMean, log2FC, color = dir)) +
+    geom_point(alpha = s$alpha * 0.8, size = s$pt) +
+    geom_hline(yintercept = 0, color = "grey30", linewidth = s$stroke) +
+    scale_x_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    scale_color_manual(values = sig_cols, breaks = c("Up", "NS", "Down"),
+                       labels = c("Up", "n.s.", "Down"), name = NULL) +
+    labs(title = "MA plot", x = "Mean normalized counts",
+         y = expression(log[2]~"(KO / WT)")) +
+    theme_pub(pub) +
+    theme(legend.position = if (pub) "none" else "bottom")
+}
+
+d1 <- show_both(p_shrink_fun, "diag_shrinkage.pdf")
+d2 <- show_both(p_hist_fun,   "diag_pvalue_hist.pdf")
+d3 <- show_both(p_ma_fun,     "diag_ma_plot.pdf")
+
+d1 | d2 | d3
+```
+
+```{r diagnostics-disp, fig.width=6, fig.height=5}
+pdf_device(file.path(FIG_DIR, "diag_dispersion.pdf"),
+           width = PUB_CM / 2.54, height = PUB_CM / 2.54, pointsize = 4)
+par(mar = c(2.2, 2.4, 1.2, 0.4), mgp = c(1.3, 0.35, 0), tcl = -0.15,
+    cex.axis = 0.8, cex.lab = 0.9)
+plotDispEsts(dds, main = "Dispersion", cex = 0.2, legend = FALSE)
+invisible(dev.off())
+
+plotDispEsts(dds, main = "Dispersion estimates")
+```
+
+## Heatmap of top differential genes
+
+```{r heatmap}
+ann_col <- data.frame(Genotype = colData(dds)$background,
+                      row.names = colnames(dds))
+hm_palette <- colorRampPalette(c(col_down, "white", col_up))(255)
+
+draw_heatmap <- function(n_genes, fontsize, main, filename = NA) {
+  top <- sig_tbl %>% slice_min(padj, n = n_genes, with_ties = FALSE)
+  if (nrow(top) < 2) {
+    message("Fewer than two significant genes; skipping heatmap.")
+    return(invisible(NULL))
+  }
+
+  mat <- mat_corr[top$ensemblID, , drop = FALSE]
+  mat <- t(scale(t(mat)))
+  rownames(mat) <- ifelse(is.na(top$symbol), top$ensemblID, top$symbol)
+
+  args <- list(mat = mat, annotation_col = ann_col,
+               annotation_colors = list(Genotype = geno_cols),
+               color = hm_palette, show_rownames = TRUE,
+               fontsize = fontsize, fontsize_row = fontsize,
+               fontsize_col = fontsize, border_color = NA,
+               treeheight_row = if (is.na(filename)) 25 else 8,
+               treeheight_col = if (is.na(filename)) 25 else 8,
+               legend = is.na(filename), annotation_legend = is.na(filename),
+               main = main)
+  if (!is.na(filename)) {
+    args$filename <- file.path(FIG_DIR, filename)
+    args$width    <- PUB_CM / 2.54
+    args$height   <- PUB_CM / 2.54
+  }
+  do.call(pheatmap, args)
+}
+
+draw_heatmap(25, 2.2, "Top 25", "heatmap_top25.pdf")
+```
+
+```{r heatmap-display, fig.width=7, fig.height=9}
+draw_heatmap(50, 8, "Top 50 genes by padj (SV-corrected VST, row z-score)")
+```
+
+## Osmosensitive gene panel
+
+The gene set from Panel B of the reference figure. Bars are log2FC with
+posterior SD; fill is the observed direction at `padj < 0.05`, stars are
+`***` padj < 0.001, `**` < 0.01, `*` < 0.05.
+
+```{r osmo-panel, fig.width=7, fig.height=5}
+osmo_genes <- c("Hspa1b", "Sgk1", "Slc5a3", "Lrrc8a", "Slc38a2",
+                "Slc12a5", "Slc6a6", "Aqp1", "Akr1b1", "Aqp4", "Nfat5")
+
+osmo_df <- res_tbl %>%
+  dplyr::filter(symbol %in% osmo_genes, !is.na(log2FC), !is.na(padj)) %>%
+  group_by(symbol) %>%
+  slice_min(padj, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(
+    dir   = case_when(padj >= panel_padj_cut ~ "NS",
+                      log2FC > 0 ~ "Up", TRUE ~ "Down"),
+    stars = case_when(padj < 0.001 ~ "***", padj < 0.01 ~ "**",
+                      padj < 0.05 ~ "*", TRUE ~ "")
+  ) %>%
+  arrange(desc(log2FC)) %>%
+  mutate(symbol = factor(symbol, levels = symbol))
+
+make_osmo_panel <- function(pub) {
+  s <- pub_style(pub)
+  ggplot(osmo_df, aes(symbol, log2FC, fill = dir)) +
+    geom_col(width = s$bar_w, linewidth = s$stroke) +
+    geom_errorbar(aes(ymin = log2FC - lfcSE, ymax = log2FC + lfcSE),
+                  width = s$err_w, linewidth = s$stroke) +
+    geom_text(aes(label = stars,
+                  y = log2FC + sign(log2FC) * lfcSE,
+                  vjust = ifelse(log2FC >= 0, -0.25, 1.15)),
+              size = s$lab * 1.15) +
+    geom_hline(yintercept = 0, color = "grey30", linewidth = s$stroke) +
+    scale_fill_manual(values = sig_cols,
+                      name = paste0("padj < ", panel_padj_cut)) +
+    scale_y_continuous(expand = expansion(mult = c(0.16, 0.16))) +
+    labs(title = "Osmosensitive genes", x = NULL,
+         y = expression(log[2]~"(KO / WT)")) +
+    theme_pub(pub) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "italic"),
+          panel.grid.major.x = element_blank(),
+          legend.position = if (pub) "none" else "right")
+}
+
+show_both(make_osmo_panel, "panel_osmosensitive.pdf")
+```
+
+## Müller glia gliosis signature
+
+Reactive gliosis is a **bidirectional** shift: Müller glia up-regulate a stress
+and intermediate-filament program while down-regulating the homeostatic
+machinery that defines the resting cell. Showing only the induced half
+overstates the case, so both tiers are plotted together — the signature is
+convincing when the left panel rises *and* the right panel falls.
+
+Bars are log2FC with posterior SD; stars are `***` padj < 0.001,
+`**` < 0.01, `*` < 0.05. Fill encodes the actual result (red up, blue down,
+grey n.s.), which is deliberately independent of the tier a gene was assigned
+to — a homeostatic marker coming out red is visible immediately.
+
+```{r gliosis-panel, fig.width=11, fig.height=5.5}
+gliosis_sets <- list(
+  # Induced in reactive Müller glia: intermediate filaments, acute-phase and
+  # stress response, JAK/STAT and cytokine signaling.
+  `Reactive (expected up)` = c(
+    "Gfap", "Vim", "Nes", "Serpina3n", "Lcn2", "Edn2", "Stat3", "Socs3",
+    "A2m", "Timp1", "Cd44", "Tnc", "Chi3l1", "Osmr", "Steap4", "Ccl2",
+    "C3", "Cebpd", "Hspb1", "Fgf2", "Clu", "Igfbp5", "Crim1"),
+  # Homeostatic Müller identity: visual-cycle, glutamate and potassium
+  # handling. Expected to fall as the cells de-differentiate.
+  `Homeostatic (expected down)` = c(
+    "Rlbp1", "Glul", "Slc1a3", "Aqp4", "Kcnj10", "Car14", "Dkk3",
+    "Slc38a3", "Glud1", "Sox9", "Apoe")
+)
+
+gliosis_df <- tibble(tier = names(gliosis_sets), symbol = gliosis_sets) %>%
+  unnest(symbol) %>%
+  inner_join(res_tbl %>%
+               dplyr::select(symbol, log2FC, lfcSE, padj, baseMean),
+             by = "symbol") %>%
+  dplyr::filter(!is.na(log2FC), !is.na(padj)) %>%
+  mutate(
+    tier = factor(tier, levels = names(gliosis_sets)),
+    dir  = case_when(padj >= panel_padj_cut ~ "NS",
+                     log2FC > 0 ~ "Up", TRUE ~ "Down"),
+    stars = case_when(padj < 0.001 ~ "***", padj < 0.01 ~ "**",
+                      padj < 0.05 ~ "*", TRUE ~ "")
+  ) %>%
+  arrange(tier, desc(log2FC)) %>%
+  mutate(symbol = factor(symbol, levels = unique(symbol)))
+
+make_gliosis_panel <- function(pub) {
+  s <- pub_style(pub)
+  ggplot(gliosis_df, aes(symbol, log2FC, fill = dir)) +
+    geom_col(width = s$bar_w, linewidth = s$stroke) +
+    geom_errorbar(aes(ymin = log2FC - lfcSE,
+                      ymax = log2FC + lfcSE),
+                  width = s$err_w, linewidth = s$stroke) +
+    geom_text(aes(label = stars,
+                  y = log2FC + sign(log2FC) * lfcSE,
+                  vjust = ifelse(log2FC >= 0, -0.25, 1.15)),
+              size = s$lab * 1.15) +
+    geom_hline(yintercept = 0, color = "grey30", linewidth = s$stroke) +
+    scale_fill_manual(values = sig_cols, name = paste0("padj < ", panel_padj_cut)) +
+    scale_y_continuous(expand = expansion(mult = c(0.16, 0.16))) +
+    facet_grid(~ tier, scales = "free_x", space = "free_x") +
+    labs(title = "Müller glia gliosis signature",
+         x = NULL, y = expression(log[2]~"(KO / WT)")) +
+    theme_pub(pub) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "italic"),
+          panel.grid.major.x = element_blank(),
+          legend.position = if (pub) "none" else "right")
+}
+
+# Wider than square: ~35 genes cannot share a 4 cm axis legibly.
+save_pub(make_gliosis_panel(TRUE), "panel_gliosis.pdf", cm = 9, cm_h = 4.5)
+make_gliosis_panel(FALSE)
+```
+
+```{r gliosis-stats}
+# Is the tier as a whole shifted, beyond the individual genes? A Wilcoxon test
+# against all other tested genes is a competitive test: it asks whether these
+# genes are more extreme than the transcriptome background, not merely whether
+# they are nonzero.
+background_lfc <- res_tbl %>%
+  dplyr::filter(!is.na(log2FC), !symbol %in% gliosis_df$symbol) %>%
+  pull(log2FC)
+
+gliosis_stats <- gliosis_df %>%
+  group_by(tier) %>%
+  summarise(
+    n_genes    = n(),
+    median_lfc = median(log2FC),
+    n_sig_up   = sum(dir == "Up"),
+    n_sig_down = sum(dir == "Down"),
+    wilcox_p   = wilcox.test(log2FC, background_lfc)$p.value,
+    .groups = "drop"
+  )
+
+knitr::kable(gliosis_stats, digits = c(0, 0, 3, 0, 0, 6),
+             caption = "Gliosis tiers vs. transcriptome background (Wilcoxon)")
+```
+
+## Retinal cell-type marker panels
+
+Whole-retina RNA-seq cannot distinguish a change in transcription within cells
+from a change in the cellular composition of the tissue. Coordinated movement
+of an entire marker panel argues for composition.
+
+```{r retina-markers, fig.width=9, fig.height=6}
+retina_markers <- list(
+  Rod         = c("Rho", "Nrl", "Nr2e3", "Gnat1", "Pde6b", "Sag", "Cnga1", "Rp1"),
+  Cone        = c("Opn1sw", "Opn1mw", "Arr3", "Gnat2", "Pde6h", "Gngt2", "Elovl2"),
+  Bipolar     = c("Vsx2", "Grm6", "Cabp5", "Prkca", "Trpm1", "Isl1"),
+  Amacrine    = c("Slc6a9", "Gad1", "Gad2", "Tfap2b", "Chat", "Slc32a1"),
+  Horizontal  = c("Lhx1", "Calb1", "Onecut1", "Onecut2"),
+  RGC         = c("Rbpms", "Sncg", "Nefl", "Pou4f1", "Thy1", "Slc17a6"),
+  Muller      = c("Rlbp1", "Glul", "Slc1a3", "Apoe", "Sox9", "Clu", "Aqp4"),
+  Astrocyte   = c("Gfap", "Pax2", "Aldh1l1"),
+  Microglia   = c("Aif1", "Cx3cr1", "P2ry12", "Csf1r", "Tmem119", "C1qa"),
+  RPE         = c("Rpe65", "Ttr", "Best1", "Lrat"),
+  Endothelial = c("Cldn5", "Pecam1", "Flt1")
+)
+
+marker_df <- tibble(cell_type = names(retina_markers), symbol = retina_markers) %>%
+  unnest(symbol) %>%
+  inner_join(res_tbl %>%
+               dplyr::select(symbol, log2FC, padj, baseMean), by = "symbol") %>%
+  dplyr::filter(!is.na(log2FC), !is.na(padj)) %>%
+  mutate(dir = case_when(padj >= panel_padj_cut ~ "NS",
+                         log2FC > 0 ~ "Up", TRUE ~ "Down"),
+         cell_type = factor(cell_type, levels = names(retina_markers)))
+
+make_marker_plot <- function(pub) {
+  s <- pub_style(pub)
+  p <- ggplot(marker_df, aes(log2FC, fct_rev(cell_type))) +
+    geom_vline(xintercept = 0, color = "grey40", linewidth = s$stroke) +
+    geom_jitter(aes(color = dir), height = 0.18,
+                size = s$pt * 1.5, alpha = s$alpha + 0.15) +
+    scale_color_manual(values = sig_cols, name = paste0("padj < ", panel_padj_cut)) +
+    labs(title = "Retinal cell-type markers",
+         x = expression(log[2]~"(KO / WT)"), y = NULL) +
+    theme_pub(pub) +
+    theme(panel.grid.major.y = element_blank(),
+          legend.position = if (pub) "none" else "right")
+
+  if (!pub) {
+    p <- p + ggrepel::geom_text_repel(
+      data = marker_df %>% dplyr::filter(dir != "NS"),
+      aes(label = symbol), size = s$lab, fontface = "italic",
+      max.overlaps = 25, box.padding = 0.25, segment.color = "grey60")
+  }
+  p
+}
+
+show_both(make_marker_plot, "panel_retina_markers.pdf")
+```
+
+```{r marker-summary}
+marker_summary <- marker_df %>%
+  group_by(cell_type) %>%
+  summarise(n_genes = n(), median_lfc = median(log2FC),
+            n_up = sum(dir == "Up"), n_down = sum(dir == "Down"),
+            .groups = "drop") %>%
+  arrange(desc(abs(median_lfc)))
+
+knitr::kable(marker_summary, digits = 3, caption = "Cell-type marker summary")
+```
+
+## Gene set enrichment (GSEA)
+
+Genes ranked by log2FC. GSEA uses the whole ranked list and needs no
+significance cutoff, which makes it sensitive to coordinated shifts that never
+reach per-gene significance.
+
+```{r msigdb-helper}
+# msigdbr changed argument names in v10 (category/subcategory ->
+# collection/subcollection). Handle both.
+get_msig <- function(collection, subcollection = NULL) {
+  fmls <- names(formals(msigdbr::msigdbr))
+  args <- list(species = "Mus musculus")
+  if ("collection" %in% fmls) {
+    args$collection <- collection
+    if (!is.null(subcollection)) args$subcollection <- subcollection
+  } else {
+    args$category <- collection
+    if (!is.null(subcollection)) args$subcategory <- subcollection
+  }
+  do.call(msigdbr::msigdbr, args)
+}
+
+msig_to_list <- function(df) {
+  df <- df %>%
+    dplyr::filter(!is.na(gene_symbol), nzchar(trimws(gene_symbol))) %>%
+    dplyr::distinct(gs_name, gene_symbol)
+  split(df$gene_symbol, df$gs_name)
+}
+
+gene_sets <- tryCatch({
+  list(Hallmark = msig_to_list(get_msig("H")),
+       `GO:BP`  = msig_to_list(get_msig("C5", "GO:BP")),
+       Reactome = msig_to_list(get_msig("C2", "CP:REACTOME")))
+}, error = function(e) {
+  message("MSigDB retrieval failed (", conditionMessage(e), "); skipping GSEA.")
+  NULL
+})
+```
+
+```{r gsea, fig.width=10, fig.height=12}
+# fgsea rejects empty, NA and duplicated names, and a non-finite stat poisons
+# the enrichment score. Enforce all four here.
+ranks <- res_tbl %>%
+  dplyr::filter(!is.na(symbol), nzchar(trimws(symbol)),
+                !is.na(log2FC), is.finite(log2FC), !is.na(padj)) %>%
+  group_by(symbol) %>%
+  slice_min(padj, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  { setNames(.$log2FC, .$symbol) }
+
+ranks <- ranks[!duplicated(names(ranks))]
+ranks <- sort(ranks, decreasing = TRUE)
+
+gsea_all <- if (!is.null(gene_sets)) {
+  map_dfr(names(gene_sets), function(coll) {
+    fgsea::fgsea(pathways = gene_sets[[coll]], stats = ranks,
+                 minSize = 15, maxSize = 500, eps = 0) %>%
+      as_tibble() %>%
+      dplyr::filter(!is.na(padj)) %>%
+      mutate(collection = coll)
+  })
+} else NULL
+
+tidy_name <- function(x) {
+  x %>% str_replace_all("^(HALLMARK|GOBP|REACTOME|WP)_", "") %>%
+    str_replace_all("_", " ") %>% str_to_sentence() %>% str_trunc(48)
+}
+
+if (!is.null(gsea_all) && nrow(gsea_all) > 0) {
+  write_csv(
+    gsea_all %>% mutate(leadingEdge = map_chr(leadingEdge, ~ paste(.x, collapse = ";"))),
+    "gsea_KOvWT_SVA.csv")
+
+  make_gsea_plot <- function(pub, coll, n_show = 10) {
+    s  <- pub_style(pub)
+    df <- gsea_all %>%
+      dplyr::filter(collection == coll) %>%
+      slice_min(padj, n = n_show, with_ties = FALSE) %>%
+      mutate(pathway = tidy_name(pathway), dir = ifelse(NES > 0, "Up", "Down"))
+    if (nrow(df) == 0) return(NULL)
+
+    ggplot(df, aes(NES, reorder(pathway, NES), fill = dir)) +
+      geom_col(width = s$bar_w, linewidth = s$stroke) +
+      geom_vline(xintercept = 0, color = "grey30", linewidth = s$stroke) +
+      scale_fill_manual(values = sig_cols, name = NULL) +
+      labs(title = paste0("GSEA: ", coll), x = "NES", y = NULL) +
+      theme_pub(pub) +
+      theme(panel.grid.major.y = element_blank(),
+            axis.text.y = element_text(size = rel(if (pub) 0.7 else 0.9)),
+            legend.position = if (pub) "none" else "right")
+  }
+
+  for (coll in names(gene_sets)) {
+    p <- make_gsea_plot(TRUE, coll, n_show = 8)
+    if (!is.null(p)) {
+      save_pub(p, paste0("gsea_", str_replace(coll, ":", ""), ".pdf"),
+               cm = 8, cm_h = 4.5)
+    }
+  }
+
+  gsea_display <- compact(map(names(gene_sets), ~ make_gsea_plot(FALSE, .x, 12)))
+  if (length(gsea_display) > 0) wrap_plots(gsea_display, ncol = 1)
+}
+```
+
+## Pathway over-representation analysis
+
+GSEA and over-representation answer different questions. GSEA asks whether a
+gene set drifts systematically across the whole ranked list; ORA asks whether
+the `padj < 0.01` set is enriched for a pathway relative to the tested
+background. A result supported by both is considerably more secure than one
+found by either alone.
+
+Four databases are queried, up- and down-regulated genes separately. KEGG and
+WikiPathways fetch over the network at render time, so each call is wrapped —
+a failure logs a message and drops that database rather than killing the
+render.
+
+```{r ora-setup}
+# The universe is every gene that survived filtering and has an Entrez ID.
+# Using all of Entrez instead would inflate every enrichment, since genes not
+# expressed in retina could never have been called.
+universe_entrez <- res_tbl %>%
+  dplyr::filter(!is.na(entrez), nzchar(trimws(entrez)), !is.na(padj)) %>%
+  pull(entrez) %>% unique()
+
+sig_entrez <- function(direction) {
+  sig_tbl %>%
+    dplyr::filter(!is.na(entrez), nzchar(trimws(entrez)),
+                  if (direction == "up") log2FC > 0 else log2FC < 0) %>%
+    pull(entrez) %>% unique()
+}
+
+cat("Universe:", length(universe_entrez), "genes\n")
+cat("Up:", length(sig_entrez("up")), " Down:", length(sig_entrez("down")), "\n")
+
+# Each entry returns an enrichResult or NULL. GO is simplified to collapse
+# redundant parent/child terms, which otherwise dominate the top of the table.
+ora_specs <- list(
+  `GO:BP` = function(g, u) {
+    e <- clusterProfiler::enrichGO(g, OrgDb = org.Mm.eg.db, universe = u,
+                                   keyType = "ENTREZID", ont = "BP",
+                                   pAdjustMethod = "BH", qvalueCutoff = 0.05,
+                                   readable = TRUE)
+    if (!is.null(e) && nrow(as.data.frame(e)) > 0) {
+      e <- clusterProfiler::simplify(e, cutoff = 0.7, by = "p.adjust", select_fun = min)
+    }
+    e
+  },
+  `GO:MF` = function(g, u) {
+    e <- clusterProfiler::enrichGO(g, OrgDb = org.Mm.eg.db, universe = u,
+                                   keyType = "ENTREZID", ont = "MF",
+                                   pAdjustMethod = "BH", qvalueCutoff = 0.05,
+                                   readable = TRUE)
+    if (!is.null(e) && nrow(as.data.frame(e)) > 0) {
+      e <- clusterProfiler::simplify(e, cutoff = 0.7, by = "p.adjust", select_fun = min)
+    }
+    e
+  },
+  `GO:CC` = function(g, u) {
+    e <- clusterProfiler::enrichGO(g, OrgDb = org.Mm.eg.db, universe = u,
+                                   keyType = "ENTREZID", ont = "CC",
+                                   pAdjustMethod = "BH", qvalueCutoff = 0.05,
+                                   readable = TRUE)
+    if (!is.null(e) && nrow(as.data.frame(e)) > 0) {
+      e <- clusterProfiler::simplify(e, cutoff = 0.7, by = "p.adjust", select_fun = min)
+    }
+    e
+  },
+  KEGG = function(g, u) {
+    e <- clusterProfiler::enrichKEGG(g, organism = "mmu", keyType = "kegg",
+                                     universe = u, pAdjustMethod = "BH",
+                                     qvalueCutoff = 0.05)
+    if (!is.null(e) && nrow(as.data.frame(e)) > 0) {
+      e <- DOSE::setReadable(e, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+    }
+    e
+  },
+  Reactome = function(g, u) {
+    ReactomePA::enrichPathway(g, organism = "mouse", universe = u,
+                              pAdjustMethod = "BH", qvalueCutoff = 0.05,
+                              readable = TRUE)
+  },
+  WikiPathways = function(g, u) {
+    e <- clusterProfiler::enrichWP(g, organism = "Mus musculus", universe = u,
+                                   pAdjustMethod = "BH", qvalueCutoff = 0.05)
+    if (!is.null(e) && nrow(as.data.frame(e)) > 0) {
+      e <- DOSE::setReadable(e, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
+    }
+    e
+  }
+)
+
+# GeneRatio and BgRatio arrive as "12/300" strings; fold enrichment is the
+# ratio of the two, and is what makes results comparable across databases with
+# very different pathway sizes.
+parse_ratio <- function(x) {
+  p <- str_split_fixed(as.character(x), "/", 2)
+  as.numeric(p[, 1]) / as.numeric(p[, 2])
+}
+
+run_one_ora <- function(db, direction) {
+  genes <- sig_entrez(direction)
+  if (length(genes) < 10) {
+    message("Only ", length(genes), " ", direction,
+            " genes with Entrez IDs; skipping ", db, ".")
+    return(tibble())
+  }
+
+  e <- tryCatch(ora_specs[[db]](genes, universe_entrez),
+                error = function(err) {
+                  message(db, " (", direction, ") failed: ", conditionMessage(err))
+                  NULL
+                })
+
+  if (is.null(e)) return(tibble())
+  df <- as.data.frame(e)
+  if (nrow(df) == 0) return(tibble())
+
+  as_tibble(df) %>%
+    mutate(database = db, direction = direction,
+           fold_enrichment = parse_ratio(GeneRatio) / parse_ratio(BgRatio)) %>%
+    # any_of("qvalue"): enrichKEGG and enrichWP do not always return a qvalue
+    # column, and a bare select() would error on the first database that omits
+    # it, taking the whole suite down with it.
+    dplyr::select(database, direction, ID, Description, GeneRatio, BgRatio,
+                  fold_enrichment, pvalue, p.adjust, any_of("qvalue"),
+                  Count, geneID)
+}
+```
+
+```{r ora-run}
+ora_all <- map_dfr(names(ora_specs), function(db) {
+  map_dfr(c("up", "down"), function(d) run_one_ora(db, d))
+})
+
+if (nrow(ora_all) > 0) {
+  write_csv(ora_all, "ora_KOvWT_SVA_allDatabases.csv")
+
+  # Excel forbids : \ / ? * [ ] in sheet names and caps them at 31 characters,
+  # so "GO:BP" would fail. Sanitize before writing.
+  ora_sheets <- split(ora_all, ora_all$database)
+  names(ora_sheets) <- names(ora_sheets) %>%
+    str_replace_all("[:\\\\/?*\\[\\]]", "_") %>%
+    str_trunc(31, ellipsis = "")
+
+  openxlsx::write.xlsx(ora_sheets,
+                       file = "ora_KOvWT_SVA_allDatabases.xlsx", overwrite = TRUE)
+
+  ora_summary <- ora_all %>%
+    dplyr::filter(p.adjust < 0.05) %>%
+    count(database, direction) %>%
+    pivot_wider(names_from = direction, values_from = n, values_fill = 0)
+
+  knitr::kable(ora_summary,
+               caption = "Significantly enriched terms per database (padj < 0.05)")
+} else {
+  message("No over-representation results returned by any database.")
+}
+```
+
+```{r ora-dotplots, fig.width=11, fig.height=7}
+# Standard dotplot: fold enrichment on x, gene count as size, significance as
+# color. Preferred over a bare -log10(p) bar chart because a highly significant
+# term drawn from a 900-gene pathway is a weaker result than a modest one from
+# a 30-gene pathway, and only fold enrichment shows that.
+make_ora_dot <- function(pub, db, n_show = 10) {
+  s  <- pub_style(pub)
+  df <- ora_all %>%
+    dplyr::filter(database == db, p.adjust < 0.05) %>%
+    group_by(direction) %>%
+    slice_min(p.adjust, n = n_show, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(Description = str_trunc(Description, 46),
+           direction = recode(direction, up = "Up in KO", down = "Down in KO"),
+           direction = factor(direction, levels = c("Up in KO", "Down in KO")))
+  if (nrow(df) == 0) return(NULL)
+
+  ggplot(df, aes(fold_enrichment, reorder(Description, fold_enrichment))) +
+    geom_point(aes(size = Count, color = -log10(p.adjust))) +
+    scale_color_viridis_c(option = "plasma", end = 0.9,
+                          name = expression(-log[10]~padj)) +
+    scale_size_continuous(range = if (pub) c(0.4, 1.8) else c(1.5, 6),
+                          name = "Genes") +
+    facet_wrap(~ direction, scales = "free_y", ncol = 1) +
+    labs(title = db, x = "Fold enrichment", y = NULL) +
+    theme_pub(pub) +
+    theme(panel.grid.major.y = element_line(linewidth = s$stroke * 0.5),
+          axis.text.y = element_text(size = rel(if (pub) 0.65 else 0.9)),
+          legend.position = if (pub) "none" else "right")
+}
+
+if (nrow(ora_all) > 0) {
+  for (db in unique(ora_all$database)) {
+    p <- make_ora_dot(TRUE, db, n_show = 6)
+    if (!is.null(p)) {
+      save_pub(p, paste0("ora_", str_replace_all(db, "[: ]", ""), ".pdf"),
+               cm = 8, cm_h = 6)
+    }
+  }
+
+  ora_display <- compact(map(unique(ora_all$database), ~ make_ora_dot(FALSE, .x, 10)))
+  if (length(ora_display) > 0) wrap_plots(ora_display, ncol = 2)
+}
+```
+
+```{r ora-top-table}
+if (nrow(ora_all) > 0) {
+  knitr::kable(
+    ora_all %>%
+      dplyr::filter(p.adjust < 0.05) %>%
+      group_by(database, direction) %>%
+      slice_min(p.adjust, n = 3, with_ties = FALSE) %>%
+      ungroup() %>%
+      dplyr::select(database, direction, Description, fold_enrichment,
+                    Count, p.adjust),
+    digits = c(0, 0, 0, 2, 0, 6),
+    caption = "Top 3 enriched terms per database and direction")
+}
+```
+
+### Where GSEA and ORA agree
+
+```{r gsea-ora-overlap}
+# Matching on cleaned term names is approximate -- the same biology is named
+# differently across databases -- so treat this as a pointer, not a tally.
+if (!is.null(gsea_all) && nrow(gsea_all) > 0 && nrow(ora_all) > 0) {
+  norm_term <- function(x) {
+    x %>% str_replace_all("^(HALLMARK|GOBP|REACTOME|WP)_", "") %>%
+      str_replace_all("[_[:punct:]]", " ") %>% str_squish() %>% str_to_lower()
+  }
+
+  gsea_sig <- gsea_all %>%
+    dplyr::filter(padj < 0.05) %>%
+    mutate(term = norm_term(pathway),
+           gsea_dir = ifelse(NES > 0, "up", "down")) %>%
+    dplyr::select(term, gsea_dir, NES, gsea_padj = padj)
+
+  ora_sig <- ora_all %>%
+    dplyr::filter(p.adjust < 0.05) %>%
+    mutate(term = norm_term(Description)) %>%
+    dplyr::select(term, ora_dir = direction, database,
+                  fold_enrichment, ora_padj = p.adjust)
+
+  overlap <- inner_join(gsea_sig, ora_sig, by = "term", relationship = "many-to-many") %>%
+    dplyr::filter(gsea_dir == ora_dir) %>%
+    arrange(gsea_padj) %>%
+    distinct(term, .keep_all = TRUE)
+
+  if (nrow(overlap) > 0) {
+    knitr::kable(head(overlap, 20), digits = 3,
+                 caption = "Terms called by both GSEA and ORA, same direction")
+  } else {
+    message("No exact term-name matches between GSEA and ORA outputs.")
+  }
+}
+```
+
+## Counts for individual genes
+
+```{r plot-counts, fig.width=10, fig.height=7}
+# A gene driven by a single sample is obvious here and nowhere else.
+make_counts_plot <- function(pub, n_genes = 9) {
+  s   <- pub_style(pub)
+  top <- sig_tbl %>% slice_min(padj, n = n_genes, with_ties = FALSE)
+  if (nrow(top) == 0) return(NULL)
+
+  counts_df <- map_dfr(seq_len(nrow(top)), function(i) {
+    d <- plotCounts(dds, gene = top$ensemblID[i], intgroup = "background",
+                    normalized = TRUE, returnData = TRUE)
+    d$gene <- ifelse(is.na(top$symbol[i]), top$ensemblID[i], top$symbol[i])
+    d
+  })
+
+  ggplot(counts_df, aes(background, count, color = background)) +
+    geom_point(position = position_jitter(width = 0.12),
+               size = s$pt * 2, alpha = 0.9) +
+    scale_color_manual(values = geno_cols, guide = "none") +
+    scale_y_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    facet_wrap(~ gene, scales = "free_y", ncol = 3) +
+    labs(title = "Top genes", x = NULL, y = "Norm. count") +
+    theme_pub(pub) +
+    theme(strip.text = element_text(face = "italic", size = rel(0.8)))
+}
+
+p <- make_counts_plot(TRUE, 6)
+if (!is.null(p)) save_pub(p, "counts_top_genes.pdf", cm = 6, cm_h = 6)
+make_counts_plot(FALSE, 9)
+```
+
+## Appendix: why SVA
+
+Revision 4 ran every analysis twice, with and without the surrogate variable,
+to test whether the adjustment was absorbing genotype signal rather than noise.
+The comparison is condensed here as justification for the modeling choice.
+
+```{r appendix-nosva}
+dds_nosva <- dds_pre
+design(dds_nosva) <- ~ background
+dds_nosva <- DESeq(dds_nosva, quiet = TRUE)
+
+res_nosva_mle <- results(dds_nosva, name = "background_KO_vs_WT", alpha = padj_cut)
+res_nosva <- lfcShrink(dds_nosva, coef = "background_KO_vs_WT",
+                       type = "apeglm", res = res_nosva_mle, quiet = TRUE)
+
+compare_tbl <- tibble(
+  ensemblID   = rownames(res_nosva),
+  noSVA_log2FC = res_nosva$log2FoldChange,
+  noSVA_padj   = res_nosva$padj
+) %>%
+  full_join(res_tbl %>%
+              dplyr::select(ensemblID, symbol, baseMean,
+                            SVA_log2FC = log2FC, SVA_padj = padj),
+            by = "ensemblID") %>%
+  mutate(called = case_when(
+    noSVA_padj < padj_cut & SVA_padj < padj_cut    ~ "Both",
+    noSVA_padj < padj_cut & !(SVA_padj < padj_cut) ~ "No SVA only",
+    SVA_padj < padj_cut & !(noSVA_padj < padj_cut) ~ "SVA only",
+    TRUE ~ "Neither"))
+
+write_csv(compare_tbl, "appendix_SVA_comparison.csv")
+
+knitr::kable(
+  tibble(
+    model = c("No SVA", "SVA"),
+    n_sig = c(sum(compare_tbl$noSVA_padj < padj_cut, na.rm = TRUE),
+              sum(compare_tbl$SVA_padj < padj_cut, na.rm = TRUE))
+  ),
+  caption = paste0("Genes called at padj < ", padj_cut))
+
+knitr::kable(count(compare_tbl, called),
+             caption = "Agreement between the two models")
+```
+
+```{r appendix-scatter, fig.width=6, fig.height=5}
+# Systematic compression toward zero on the SVA axis would be the signature of
+# a surrogate variable that had absorbed part of the genotype effect. A slope
+# at or near 1 says it did not.
+p_appendix_fun <- function(pub) {
+  s  <- pub_style(pub)
+  df <- compare_tbl %>% dplyr::filter(!is.na(noSVA_log2FC), !is.na(SVA_log2FC))
+  r     <- round(cor(df$noSVA_log2FC, df$SVA_log2FC), 3)
+  slope <- round(coef(lm(SVA_log2FC ~ noSVA_log2FC, data = df))[2], 3)
+
+  ggplot(df, aes(noSVA_log2FC, SVA_log2FC)) +
+    geom_point(alpha = s$alpha * 0.6, size = s$pt, color = "#3B4A6B") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                color = "grey40", linewidth = s$stroke) +
+    geom_smooth(method = "lm", se = FALSE, color = col_up,
+                linewidth = s$stroke * 1.6, formula = y ~ x) +
+    labs(title = "log2FC: SVA vs. no SVA",
+         subtitle = paste0("r = ", r, ", slope = ", slope),
+         x = "No SVA", y = "SVA") +
+    theme_pub(pub)
+}
+
+show_both(p_appendix_fun, "appendix_lfc_scatter.pdf")
+```
+
+## Figure inventory
+
+```{r figure-inventory}
+fig_files <- list.files(FIG_DIR, pattern = "\\.pdf$", full.names = TRUE)
+
+cat("Figures written to '", FIG_DIR, "/'. Square panels are ",
+    PUB_CM, " x ", PUB_CM, " cm; multi-panel and pathway figures are wider ",
+    "where a 4 cm axis cannot hold the labels legibly.\n", sep = "")
+
+knitr::kable(
+  tibble(file = basename(fig_files),
+         size_kb = round(file.size(fig_files) / 1024, 1)) %>% arrange(file),
+  caption = "Publication figures")
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```

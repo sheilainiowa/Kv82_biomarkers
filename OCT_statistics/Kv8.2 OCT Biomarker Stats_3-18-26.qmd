@@ -1,0 +1,825 @@
+---
+title: "Supplemental File S1:"
+subtitle: "Statistical outputs for OCT data (Tables S1A-S4C)"
+format:
+  pdf:
+    pdf-engine: lualatex
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    colorlinks: true
+    linkcolor: navy
+    urlcolor: navy
+    fig-pos: "H"
+    fig-align: center
+    keep-tex: false
+    highlight-style: github
+    fontsize: 11pt
+    mainfont: "TeX Gyre Heros"
+    sansfont: "TeX Gyre Heros"
+    monofont: "DejaVu Sans Mono"
+    geometry:
+      - top=1in
+      - bottom=1in
+      - left=1in
+      - right=1in
+    include-in-header:
+      text: |
+        \usepackage[table]{xcolor}
+        \usepackage{colortbl}
+        \usepackage{setspace}
+        \setstretch{1.15}
+        \usepackage{float}
+        \usepackage{booktabs}
+        \usepackage{threeparttable}
+        \usepackage{tabularx}
+        \usepackage{makecell}
+        \usepackage{caption}
+        \captionsetup[table]{labelformat=empty,labelsep=none}
+        \usepackage{float}
+        \floatplacement{table}{H}
+
+          
+execute:
+  echo: false        
+  warning: false
+  message: false
+  error: false
+  freeze: auto
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(purrr)
+library(stringr)
+
+library(readxl)
+library(knitr)
+library(kableExtra)
+library(broom.mixed)
+
+library(lme4)     
+library(lmerTest) 
+library(emmeans)  
+library(ggpubr)   
+library(ggsignif)
+library(patchwork)
+
+```
+
+```{r}
+#| label: table-helper1
+#| include: true
+#| echo: false
+
+iovs_makecell_headers <- function(nms) {
+  # 1) replace <br> or <BR> with LaTeX line breaks
+  nms <- gsub("(?i)<br\\s*/?>", " \\\\ ", nms, perl = TRUE)
+  # 2) wrap any header containing '\\' in \makecell{...}
+  nms <- vapply(nms, function(x) {
+    if (grepl("\\\\\\\\", x)) sprintf("\\makecell{%s}", x) else x
+  }, character(1))
+  nms
+}
+
+tab_iovs <- function(df, caption = NULL, align = NULL, font_size = 10) {
+  if (is.null(align)) {
+    align <- paste(ifelse(vapply(df, is.numeric, TRUE), "r", "l"), collapse = "")
+  }
+
+  
+  colnames(df) <- iovs_makecell_headers(colnames(df))
+
+  knitr::kable(
+    df,
+    format    = "latex",
+    booktabs  = TRUE,  
+    caption   = caption,
+    align     = align,
+    escape    = FALSE,  
+    longtable = FALSE,  
+    linesep   = ""      
+  ) |>
+    kableExtra::kable_styling(
+      latex_options = c("hold_position"),
+      font_size     = font_size
+    )
+}
+
+```
+
+```{r}
+#| label: table-helper2
+#| include: true
+#| echo: false
+
+tidy_anova <- function(anova_obj, digits = 2, p_digits = 2) {
+  df <- tryCatch(broom::tidy(anova_obj), error = function(e) NULL)
+  if (is.null(df)) {
+    df <- as.data.frame(anova_obj)
+    if (!("term" %in% names(df))) {
+      df <- tibble::rownames_to_column(df, var = "term")
+    }
+  }
+
+  nm <- names(df)
+  has_numden <- all(c("NumDF","DenDF") %in% nm)
+
+  out <- if (has_numden) {
+    df |>
+      dplyr::select(dplyr::any_of(c("term","sumsq","meansq","NumDF","DenDF","statistic","p.value"))) |>
+      dplyr::rename(
+        Term       = term,
+        `Sum Sq`   = sumsq,
+        `Mean Sq`  = meansq,
+        `F value`  = statistic,
+        `Pr(>F)`   = p.value
+      )
+  } else {
+    df |>
+      dplyr::select(dplyr::any_of(c("term","sumsq","meansq","df","statistic","p.value"))) |>
+      dplyr::rename(
+        Term       = term,
+        `Sum Sq`   = sumsq,
+        `Mean Sq`  = meansq,
+        DF         = df,
+        `F value`  = statistic,
+        `Pr(>F)`   = p.value
+      )
+  }
+
+  out |>
+    dplyr::mutate(
+      dplyr::across(where(is.numeric) & !dplyr::matches("^Pr\\(>F\\)$"),
+                    ~ round(.x, digits)),
+      `Pr(>F)` = if ("Pr(>F)" %in% names(out))
+                   formatC(`Pr(>F)`, format = "e", digits = p_digits)
+                 else NULL
+    )
+}
+
+```
+
+## Method
+
+We used a linear mixed model with fixed effects of genotype, condition, side, and all interactions. The model included a random intercept for mouse nested within genotype. The test of interest was the interaction between genotype and condition. We used the model to estimate means for all conditions.
+
+## 1. ELM-RPE
+
+```{r}
+#| label: elm-rpe_modeling
+#| include: true
+#| echo: false
+#| warning: false
+
+
+data_er <- read_excel("Kv82_exp7_all_biomarkers.xlsx", sheet = "elmrpe")
+data_er_long <- data_er |>
+    pivot_longer(
+    cols = c(light, dark),
+    names_to = "condition",
+    values_to = "value")
+
+# Per-mouse averages preserving genotype × CONDITION
+data_er_c <- data_er_long |>
+  group_by(mouse, genotype, condition) |>
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(
+    genotype    = factor(genotype, levels = c("Het", "KO")),
+    condition = factor(condition, levels = c("dark", "light"),
+                       labels = c("Dark", "Light"))
+  )
+
+# Per-mouse averages preserving genotype × SIDE
+data_er_s <- data_er_long |>
+  group_by(mouse, genotype, side) |>
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(
+    genotype = factor(genotype, levels = c("Het", "KO")),
+    side   = factor(side,   levels = c("Inferior", "Superior"))
+  )
+# Model 1: genotype × Condition
+model_er_cond <- lmer(mean_value ~ genotype * condition + (1 | mouse), data = data_er_c)
+anova_er_cond <- anova(model_er_cond, type = 3)
+anova_er_cond_tidy <- tidy_anova(anova_er_cond)
+tab_iovs(anova_er_cond_tidy, 
+         caption = "\\textbf{Table S1A. }ELM-RPE: Type III ANOVA results (genotype × condition)")
+
+
+# Model 2: genotype × Side
+model_er_side <- lmer(mean_value ~ genotype * side + (1 | mouse), data = data_er_s)
+anova_er_side <- anova(model_er_side, type = 3)
+anova_er_side_tidy <- tidy_anova(anova_er_side)
+tab_iovs(anova_er_side_tidy, 
+         caption = "\\textbf{Table S1B. }ELM-RPE: Type III ANOVA results (genotype × side)")
+
+
+```
+
+-   The main effect of genotype on ELM-RPE thickness was highly significant (p \< 0.0001).
+
+-   There were also significant effects of condition (p \< 0.0001), the genotype x condition interaction (p = 0.0010), side (p \< 0.0001) and the genotype x side interaction (p = 0.007). Therefore, data were analyzed separately by condition and side.
+
+```{r}
+#| label: tbl_elm-rpe_emms
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S1C. } ELM–RPE: Estimated marginal means."
+
+
+data_er_long <- data_er |>
+  tidyr::pivot_longer(c(light, dark), names_to = "condition", values_to = "value") |>
+  dplyr::mutate(
+    genotype    = factor(genotype,   levels = c("Het","KO")),
+    condition = factor(condition, levels = c("dark","light"), labels = c("Dark","Light")),
+    side      = factor(side,     levels = c("Inferior","Superior")),
+    mouse     = factor(mouse)
+  )
+
+
+er_lmm_model <- lmer(value ~ genotype * condition * side + (1 | mouse), data = data_er_long)
+
+er_emm <- emmeans(er_lmm_model, ~ genotype | condition * side)
+
+er_emm_df <- as.data.frame(confint(er_emm, level = 0.95)) |>
+  dplyr::transmute(
+    Condition = condition,
+    Side      = side,
+    Genotype    = genotype,
+    Mean      = round(emmean, 2),
+    SE        = round(SE, 2),
+    'lower CI'       = round(lower.CL, 2),
+    'upper CI'       = round(upper.CL, 2)
+  )
+ 
+knitr::kable(
+  er_emm_df,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,                    
+  align     = c("l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+```
+
+```{r}
+#| label: tbl_elm-rpe_contrasts_genotype
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S1D. }ELM–RPE: Het–KO contrasts by condition within side."
+
+# Het–KO contrasts (Holm, with 95% CI)
+er_contr_hetko <- contrast(er_emm, method = "pairwise",
+                           by = c("condition","side"), adjust = "holm")
+hk_sum <- as.data.frame(summary(er_contr_hetko, infer = c(TRUE, TRUE))) |>
+  dplyr::transmute(
+    Condition = condition,
+    Side      = side,
+    'Estimate' = round(estimate, 2),
+    'lower CI' = round(lower.CL, 2),
+    'upper CI' = round(upper.CL, 2),
+    'Holm-adj. p'   = formatC(p.value, format = "e", digits = 2)
+  ) |>
+  dplyr::distinct(Condition, Side, .keep_all = TRUE)
+
+knitr::kable(
+  hk_sum,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,                    
+  align     = c("l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
+
+```{r}
+#| label: tbl_elm-rpe_contrasts_cond
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S1E. }ELM-RPE: Light–Dark contrasts by genotype within side."
+
+# Light–Dark contrasts (Holm, with 95% CI)
+er_contr_ld <- contrast(er_emm, method = "revpairwise",
+                        by = c("genotype","side"), adjust = "holm")
+ld_sum <- as.data.frame(summary(er_contr_ld, infer = c(TRUE, TRUE))) |>
+  dplyr::transmute(
+    Genotype = genotype,
+    Side   = side,
+    'Estimate' = round(estimate, 2),
+    'lower CI' = round(lower.CL, 2),
+    'upper CI' = round(upper.CL, 2),
+    'Holm-adj. p'   = formatC(p.value, format = "e", digits = 2)
+  )
+
+knitr::kable(
+  ld_sum,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,                    
+  align     = c("l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
+
+## 2. $\Delta$ ELM-RPE
+
+```{r}
+#| label: delta_interactions
+#| include: true
+#| echo: false
+#| warning: false
+
+data_er_delta <- data_er |>
+  dplyr::filter(!is.na(delta)) |>
+  dplyr::mutate(
+    genotype = factor(genotype, levels = c("Het","KO")),
+    side   = factor(side,   levels = c("Inferior","Superior"))
+  ) 
+
+er_delta_lmm <- lmerTest::lmer(delta ~ genotype * side + (1 | mouse),
+                               data = data_er_delta)
+
+# Model: genotype × Side
+model_er_delta <- lmer(delta ~ genotype * side + (1 | mouse), data = data_er_delta)
+anova_er_delta <- anova(model_er_delta, type = 3)
+anova_er_delta_tidy <- tidy_anova(anova_er_delta)
+tab_iovs(anova_er_side_tidy, caption = "\\textbf{Table S2A. }Delta ELM-RPE: Type III ANOVA Results (genotype × side).")
+
+```
+
+-   The main effect of genotype on ΔELM-RPE thickness was highly significant (p \< 0.0001).
+
+-   There were also significant effects of side (p \< 0.0001) and the genotype x side interaction (p = 0.0074). Therefore, data were analyzed separately by side.
+
+```{r}
+#| label: tbl_delta_emms
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S2B. }Delta ELM-RPE: Estimated marginal means."
+
+data_delta <- data_er |>
+  dplyr::mutate(
+    genotype = factor(genotype, levels = c("Het","KO")),
+    side   = factor(side,   levels = c("Inferior","Superior")),
+    delta  = light - dark
+  ) |>
+  dplyr::select(mouse, genotype, side, delta)
+
+
+delta_lmm <- lme4::lmer(delta ~ genotype * side + (1 | mouse), data = data_delta)
+delta_emm <- emmeans(delta_lmm, ~ genotype | side)
+
+d_emm_df <- as.data.frame(confint(delta_emm, level = 0.95)) |>
+  dplyr::transmute(
+    Side   = side,
+    Genotype = genotype,
+    Mean   = round(emmean, 2),
+    SE     = round(SE, 2),
+    'lower CI'    = round(lower.CL, 2),
+    'upper CI'    = round(upper.CL, 2)
+  ) |>
+  dplyr::arrange(Side, Genotype)
+
+knitr::kable(
+  d_emm_df,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,                    
+  align     = c("l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
+
+```{r}
+#| label: tbl_delta_emms
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S2Bi. }Delta ELM-RPE: Estimated marginal means, with SD."
+
+data_delta <- data_er |>
+  dplyr::mutate(
+    genotype = factor(genotype, levels = c("Het", "KO")),
+    side     = factor(side, levels = c("Inferior", "Superior")),
+    delta    = light - dark
+  ) |>
+  dplyr::select(mouse, genotype, side, delta)
+
+delta_lmm <- lme4::lmer(delta ~ genotype * side + (1 | mouse), data = data_delta)
+
+delta_emm <- emmeans::emmeans(delta_lmm, ~ genotype | side)
+
+sd_df <- data_delta |>
+  dplyr::group_by(side, genotype) |>
+  dplyr::summarise(
+    SD = stats::sd(delta, na.rm = TRUE),
+    n  = sum(!is.na(delta)),
+    .groups = "drop"
+  )
+
+d_emm_df <- as.data.frame(confint(delta_emm, level = 0.95)) |>
+  dplyr::left_join(
+    sd_df,
+    by = c("side", "genotype")
+  ) |>
+  dplyr::transmute(
+    Side       = side,
+    Genotype   = genotype,
+    Mean       = round(emmean, 2),
+    SD         = round(SD, 2),
+    SE         = round(SE, 2),
+    `lower CI` = round(lower.CL, 2),
+    `upper CI` = round(upper.CL, 2),
+    n          = n
+  ) |>
+  dplyr::arrange(Side, Genotype)
+
+knitr::kable(
+  d_emm_df,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,
+  align     = c("l", "l", "r", "r", "r", "r", "r", "r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+```
+
+```{r}
+#| label: tbl_delta_contrasts
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S2C. }Delta ELM-RPE: Het–KO contrasts within side."
+
+delta_contr_hk <- emmeans::contrast(delta_emm, method = "pairwise", by = "side", adjust = "holm")
+
+hk_tbl <- as.data.frame(summary(delta_contr_hk, infer = c(TRUE, TRUE))) |>
+  dplyr::transmute(
+    Side     = side,
+    Estimate = round(estimate, 2),
+    'lower CI'      = round(lower.CL, 2),
+    'upper CI'      = round(upper.CL, 2),
+    `Holm-adj. p` = formatC(p.value, format = "e", digits = 2)
+  ) |>
+  dplyr::arrange(Side)
+
+knitr::kable(
+  hk_tbl,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,                    
+  align     = c("l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+```
+
+```{r}
+
+```
+
+## 3. ONL
+
+```{r}
+#| label: onl_tidy_4_modeling
+#| include: true
+
+data_onl <- read_excel("Kv82_exp7_all_biomarkers.xlsx", sheet = "onl")
+data_onl_long <- data_onl |>
+    pivot_longer(
+    cols = c(light, dark),
+    names_to = "condition",
+    values_to = "value")
+
+# 1) Per-mouse averages preserving genotype × CONDITION
+data_onl_cond <- data_onl_long |>
+  group_by(mouse, genotype, condition) |>
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(
+    genotype    = factor(genotype, levels = c("Het", "KO")),
+    condition = factor(condition, levels = c("dark", "light"),
+                       labels = c("Dark", "Light"))
+  )
+
+# 2) Per-mouse averages preserving genotype × SIDE
+data_onl_side <- data_onl_long |>
+  group_by(mouse, genotype, side) |>
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+  mutate(
+    genotype = factor(genotype, levels = c("Het", "KO")),
+    side   = factor(side,   levels = c("Superior", "Inferior"))
+  )
+
+```
+
+```{r}
+#| label: onl_interactions
+#| include: true
+#| echo: false
+#| warning: false
+
+
+# Model 1: genotype × Condition
+model_onl_cond <- lmer(mean_value ~ genotype * condition + (1 | mouse), data = data_onl_cond)
+anova_onl_cond <- anova(model_onl_cond, type = 3)
+anova_onl_cond_tidy <- tidy_anova(anova_onl_cond)
+tab_iovs(anova_onl_cond_tidy, 
+      caption = "\\textbf{Table S3A. }ONL: Type III ANOVA results (genotype × condition)")
+
+
+# Model 2: genotype × Side
+model_onl_side <- lmer(mean_value ~ genotype * side + (1 | mouse), data = data_onl_side)
+anova_onl_side <- anova(model_onl_side, type = 3)
+anova_onl_side_tidy <- tidy_anova(anova_onl_side)
+tab_iovs(anova_onl_side_tidy, 
+        caption = "\\textbf{Table S3B. }ONL: Type III ANOVA results (genotype × side)")
+
+```
+
+-   The main effect of genotype on ONL thickness was highly significant (p \< 0.0001).
+
+-   The effects of condition (p = 0.58) and side (p = 0.63) were not significant.
+
+-   However, the genotype × condition (p=0.013) and genotype × side (p = 0.0003) interactions were significant. Therefore, data were analyzed separately by condition and side.
+
+```{r}
+#| label: tbl_onl_emms
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S3C. }ONL: Estimated marginal means."
+
+data_onl_long <- data_onl |>
+  tidyr::pivot_longer(c(light, dark), names_to = "condition", values_to = "value") |>
+  dplyr::mutate(
+    genotype    = factor(genotype,   levels = c("Het","KO")),
+    condition = factor(condition, levels = c("dark","light"),
+                        labels = c("Dark","Light")),
+    side      = factor(side,     levels = c("Inferior","Superior")),
+    mouse     = factor(mouse)
+  )
+
+# Type-III contrasts
+options(contrasts = c("contr.sum", "contr.poly"))
+
+onl_lmm_model <- lmer(value ~ genotype * condition * side + (1 | mouse),
+                      data = data_onl_long)
+
+onl_emm <- emmeans(onl_lmm_model, ~ genotype | condition * side)
+
+# Format like Table S3
+onl_emm_df <- as.data.frame(summary(onl_emm, infer = TRUE)) |>
+  dplyr::select(condition, side, genotype, emmean, SE, lower.CL, upper.CL) |>
+  dplyr::rename(
+    Condition = condition,
+    Side      = side,
+    Genotype    = genotype,
+    Mean      = emmean,
+    `lower CI`= lower.CL,
+    `upper CI`= upper.CL
+  ) |>
+  dplyr::mutate(
+    Mean     = round(Mean, 2),
+    SE       = round(SE, 2),
+    `lower CI` = round(`lower CI`, 2),
+    `upper CI` = round(`upper CI`, 2)
+  )
+
+knitr::kable(
+  onl_emm_df,
+  format    = "latex",
+  booktabs  = TRUE,
+  align     = c("l","l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
+
+```{r}
+#| label: tbl_onl_contrasts_genotype
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S3D. }ONL: Het–KO contrasts by condition within side."
+
+# Het–KO contrasts (Holm, with 95% CI)
+onl_contr_hetko <- contrast(onl_emm, method = "pairwise",
+                           by = c("condition","side"), adjust = "holm")
+onl_hk_sum <- as.data.frame(summary(onl_contr_hetko, infer = c(TRUE, TRUE))) |>
+  dplyr::transmute(
+    Condition = condition,
+    Side      = side,
+    'Estimate' = round(estimate, 2),
+    'lower CI' = round(lower.CL, 2),
+    'upper CI' = round(upper.CL, 2),
+    'Holm-adj. p'   = formatC(p.value, format = "e", digits = 2)
+  ) |>
+  dplyr::distinct(Condition, Side, .keep_all = TRUE)
+
+knitr::kable(
+  onl_hk_sum,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,                    
+  align     = c("l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
+
+```{r}
+#| label: tbl_onl_contrasts_cond
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S3E. }ONL: Light–Dark contrasts by genotype within side."
+
+# Light–Dark contrasts (Holm, with 95% CI)
+onl_contr_ld <- contrast(onl_emm, method = "revpairwise",
+                        by = c("genotype","side"), adjust = "holm")
+onl_ld_sum <- as.data.frame(summary(onl_contr_ld, infer = c(TRUE, TRUE))) |>
+  dplyr::transmute(
+    Genotype = genotype,
+    Side   = side,
+    'Estimate' = round(estimate, 2),
+    'lower CI' = round(lower.CL, 2),
+    'upper CI' = round(upper.CL, 2),
+    'Holm-adj. p'   = formatC(p.value, format = "e", digits = 2)
+  )
+
+knitr::kable(
+  onl_ld_sum,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,                    
+  align     = c("l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
+
+## 4. $\Delta$ ONL
+
+```{r}
+#| label: delta_onl_interactions
+#| include: true
+#| echo: false
+#| warning: false
+
+data_onl <- readxl::read_excel("Kv82_exp7_all_biomarkers.xlsx", sheet = "onl")
+
+data_onl_delta <- data_onl |>
+  dplyr::filter(!is.na(delta)) |>
+  dplyr::mutate(
+    genotype = factor(genotype, levels = c("Het","KO")),
+    side   = factor(side,   levels = c("Inferior","Superior"))
+  )
+
+onl_delta_lmm <- lmerTest::lmer(
+  delta ~ genotype * side + (1 | mouse),
+  data = data_onl_delta
+)
+
+# Model: genotype × Side
+model_onl_delta <- lmerTest::lmer(
+  delta ~ genotype * side + (1 | mouse),
+  data = data_onl_delta
+)
+
+anova_onl_delta <- anova(model_onl_delta, type = 3)
+anova_onl_delta_tidy <- tidy_anova(anova_onl_delta)
+
+tab_iovs(
+  anova_onl_delta_tidy,
+  caption = "\\textbf{Table S4A. }Delta ONL: Type III ANOVA Results (genotype × side)."
+)
+
+```
+
+-   The main effect of genotype on ΔONL thickness was significant (p = 0.013).
+
+-   The main effect of side did not reach statistical significance (p = 0.083), and there was no evidence for a genotype × side interaction (p = 0.58). Therefore, ΔONL data were analyzed with genotype as the primary factor; stratification by side was used for consistent visualization purposes.
+
+```{r}
+#| label: tbl_delta_onl_emms
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S4B. }Delta ONL: Estimated marginal means."
+
+data_onl <- readxl::read_excel("Kv82_exp7_all_biomarkers.xlsx", sheet = "onl")
+
+data_delta_onl <- data_onl |>
+  dplyr::mutate(
+    genotype    = factor(genotype, levels = c("Het","KO")),
+    side      = factor(side,   levels = c("Inferior","Superior")),
+    delta_onl = light - dark
+  ) |>
+  dplyr::select(mouse, genotype, side, delta_onl)
+
+delta_onl_lmm <- lme4::lmer(
+          delta_onl ~ genotype * side + (1 | mouse), data = data_delta_onl)
+
+delta_onl_emm <- emmeans::emmeans(delta_onl_lmm, ~ genotype | side)
+
+
+d_onl_emm_df <- as.data.frame(confint(delta_onl_emm, level = 0.95)) |>
+  dplyr::transmute(
+    Side       = side,
+    Genotype     = genotype,
+    Mean       = round(emmean, 2),
+    SE         = round(SE, 2),
+    `lower CI` = round(lower.CL, 2),
+    `upper CI` = round(upper.CL, 2)
+  ) 
+
+
+knitr::kable(
+  d_onl_emm_df,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,
+  align     = c("l","l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
+
+```{r}
+#| label: tbl_delta_onl_contrasts_genotype
+#| include: true
+#| echo: false
+#| message: false
+#| warning: false
+#| tbl-cap: "\\textbf{Table S4C. }Delta ONL: Het–KO contrasts within side."
+
+# Het–KO contrasts within side (Holm, with 95% CI)
+delta_onl_contr_genotype <- emmeans::contrast(
+  delta_onl_emm,
+  method = "revpairwise",
+  by = "side",
+  adjust = "holm"
+)
+
+delta_onl_sum <- as.data.frame(
+  summary(delta_onl_contr_genotype, infer = c(TRUE, TRUE))
+) |>
+  dplyr::transmute(
+    Side        = side,
+    `Estimate`  = round(estimate, 2),
+    `lower CI`  = round(lower.CL, 2),
+    `upper CI`  = round(upper.CL, 2),
+    `Holm-adj. p` = formatC(p.value, format = "e", digits = 2)
+  )
+
+knitr::kable(
+  delta_onl_sum,
+  format    = "latex",
+  booktabs  = TRUE,
+  caption   = NULL,
+  align     = c("l","r","r","r","r"),
+  escape    = TRUE,
+  longtable = FALSE,
+  linesep   = ""
+)
+
+```
